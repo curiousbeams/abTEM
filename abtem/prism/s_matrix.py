@@ -47,13 +47,13 @@ from abtem.detectors import (
     validate_detectors,
 )
 from abtem.measurements import BaseMeasurements
-from abtem.multislice import allocate_multislice_measurements, multislice_and_detect
+from abtem.multislice import allocate_multislice_measurements, multislice_and_detect, RealSpaceMultislice, FourierMultislice, conventional_multislice_step, FresnelPropagator, _aggregate_slices_by_exit_planes
 from abtem.potentials.iam import BasePotential, validate_potential
 from abtem.prism.utils import batch_crop_2d, minimum_crop, plane_waves, wrapped_crop_2d
 from abtem.scan import BaseScan, GridScan, validate_scan
 from abtem.transfer import CTF
 from abtem.waves import BaseWaves, Probe, Waves, _antialias_cutoff_gpts
-
+from abtem.antialias import AntialiasAperture
 
 def _extract_measurement(array, index):
     if array.size == 0:
@@ -2180,3 +2180,285 @@ class SMatrix(BaseSMatrix, Ensemble, CopyMixin, EqualityMixin):
             max_batch_reduction=max_batch_reduction,
             ctf=ctf,
         )
+
+class ReciprocitySMatrix(SMatrix):
+    def __init__(self,
+        semiangle_cutoff: float,
+        energy: float,
+        potential: Atoms | BasePotential = None,
+        gpts: int | tuple[int, int] = None,
+        sampling: float | tuple[float, float] = None,
+        extent: float | tuple[float, float] = None,
+        interpolation: int | tuple[int, int] = 1,
+        downsample: bool | str = "cutoff",
+        # tilt: Tuple[float, float] = (0.0, 0.0),
+        device: str = None,
+        store_on_host: bool = False,
+        algorithm: FourierMultislice | RealSpaceMultislice = FourierMultislice(),
+    ):
+        super().__init__(
+            semiangle_cutoff = semiangle_cutoff,
+            energy = energy,
+            potential = potential,
+            gpts = gpts,
+            sampling = sampling,
+            extent = extent,
+            interpolation = interpolation,
+            downsample = downsample,
+            # tilt: Tuple[float, float] = (0.0, 0.0),
+            device = device,
+            store_on_host = store_on_host
+        )
+        self._algorithm = algorithm
+
+    @property
+    def algorithm(self):
+        return self._algorithm
+    
+    @staticmethod
+    def _s_matrix(*args, potential_partial, **kwargs):
+        potential = potential_partial(*args).item()
+        
+        # CHANGE THIS LINE: Instantiate ReciprocitySMatrix instead of SMatrix
+        s_matrix = ReciprocitySMatrix(potential=potential, **kwargs)
+        
+        # Since you are inside s_matrix.py, this helper function is available to you
+        return _wrap_with_array(s_matrix)
+    
+    @staticmethod
+    def _build_s_matrix(s_matrix, wave_vector_range=slice(None), algorithm: FourierMultislice | RealSpaceMultislice = FourierMultislice(), pbar: bool = False, ):
+        if isinstance(s_matrix, np.ndarray):
+            s_matrix = s_matrix.item()
+
+        if isinstance(wave_vector_range, np.ndarray):
+            wave_vector_range = slice(*wave_vector_range.item())
+
+        xp = get_array_module(s_matrix.device)
+
+        wave_vectors = xp.asarray(s_matrix.wave_vectors, dtype=xp.float32)
+
+        array = plane_waves(
+            wave_vectors[wave_vector_range], s_matrix.extent, s_matrix.gpts
+        )
+
+        array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+
+        waves = Waves(
+            array,
+            energy=s_matrix.energy,
+            extent=s_matrix.extent,
+            ensemble_axes_metadata=[
+                OrdinalAxis(values=wave_vectors[wave_vector_range])
+            ],
+        )
+        
+        if s_matrix.potential is not None:
+            waves = multislice_and_detect(
+                waves, s_matrix.potential, [WavesDetector()], algorithm=algorithm, pbar=pbar
+            )[0]
+
+        if s_matrix.downsampled_gpts != s_matrix.gpts:
+            waves.metadata["adjusted_antialias_cutoff_gpts"] = (
+                waves.antialias_cutoff_gpts
+            )
+
+            waves = waves.downsample(
+                gpts=s_matrix.downsampled_gpts,
+                normalization="intensity",
+            )
+
+        if s_matrix.store_on_host and s_matrix.device == "gpu":
+            waves = waves.to_cpu()
+
+        return waves.array
+        
+    def overlap_propagated_exit_waves(
+        self,
+        source,
+        max_batch_size="auto",
+    ):
+        """
+        Build the plane waves of the scattering matrix and propagate them through the
+        potential using the multislice algorithm.
+
+        Returns
+        -------
+        s_matrix_array : SMatrixArray
+            The built scattering matrix.
+        """
+        downsampled_gpts = self.downsampled_gpts
+        # s_matrix_blocks = self.ensemble_blocks(1)
+        wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
+        wave_vector_blocks = self._wave_vector_blocks(
+            wave_vector_chunks, lazy=False
+        )
+
+        potential = self.potential
+        num_exit_planes = len(potential.exit_planes)
+        xp = get_array_module(potential._array)
+
+        s_ep, s_n, s_m = source.shape
+        if s_ep != num_exit_planes:
+            raise ValueError()
+        if downsampled_gpts[0] != s_n or downsampled_gpts[1] != s_m:
+            raise ValueError()
+
+        coherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+        coherent_intensities_complex = xp.zeros(len(self),dtype=xp.complex64)
+        incoherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+
+        # Lets first get it to work with exit_planes = 1 for simplicity
+        # effective_slices = _aggregate_slices_by_exit_planes(
+        #     potential, potential.exit_planes
+        # )    
+
+        for i, _, s_matrix in self.generate_blocks(1):
+            s_matrix = s_matrix.item()
+            for start, stop in wave_vector_blocks:
+                previous_wave = None
+                for slice_index in range(num_exit_planes-1):
+                    array, array_fullres = self._build_s_matrix_per_slice(
+                        s_matrix, 
+                        slice_index,
+                        slice(start, stop),
+                        previous_waves=previous_wave,
+                        algorithm=self._algorithm,
+                    )
+                    previous_wave = array_fullres.copy()
+
+                    coherent_intensities_complex[start:stop] += xp.sum(source.array[slice_index,None,:,:] * array.conj(),axis=(1,2))
+                    incoherent_intensities[start:stop] += xp.sum(xp.abs(source.array[slice_index,None,:,:])**2 * xp.abs(array)**2,axis=(1,2))
+                    
+            coherent_intensities = xp.abs(coherent_intensities_complex)**2
+        dummy_probes = self.dummy_probes()
+        aperture = dummy_probes.aperture._evaluate_kernel(dummy_probes)
+        indices = xp.where(aperture>0)
+        
+        coherent_intensities_array = aperture.copy()
+        coherent_intensities_array[indices[0],indices[1]] = coherent_intensities - coherent_intensities.min()
+        
+        incoherent_intensities_array = aperture.copy()
+        incoherent_intensities_array[indices[0],indices[1]] = incoherent_intensities - incoherent_intensities.min()
+
+        return xp.asnumpy(coherent_intensities_array), xp.asnumpy(incoherent_intensities_array)
+    
+    @staticmethod
+    def _build_s_matrix_per_slice(s_matrix, index: int, 
+                                  wave_vector_range=slice(None), 
+                                  previous_waves: np.ndarray = None, 
+                                  algorithm: FourierMultislice | RealSpaceMultislice = FourierMultislice(), 
+                                  pbar: bool = False, 
+                                  antialias_aperture: AntialiasAperture = AntialiasAperture(),
+                                  propagator: FresnelPropagator = FresnelPropagator()):
+        if isinstance(s_matrix, np.ndarray):
+            s_matrix = s_matrix.item()
+
+        if isinstance(wave_vector_range, np.ndarray):
+            wave_vector_range = slice(*wave_vector_range.item())
+
+        xp = get_array_module(s_matrix.device)
+        
+        wave_vectors = xp.asarray(s_matrix.wave_vectors, dtype=xp.float32)
+
+        if previous_waves is None: 
+            array = plane_waves(
+                wave_vectors[wave_vector_range], s_matrix.extent, s_matrix.gpts
+            )
+
+            array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+
+        else:
+            array = previous_waves
+
+        waves = Waves(
+            array,
+            energy=s_matrix.energy,
+            extent=s_matrix.extent,
+            ensemble_axes_metadata=[
+                OrdinalAxis(values=wave_vectors[wave_vector_range])
+            ],
+        )
+
+        if s_matrix.potential is not None:
+            waves = conventional_multislice_step(
+                waves, 
+                s_matrix.potential[index], 
+                antialias_aperture=antialias_aperture,
+                propagator=propagator,
+            )
+
+        waves_fullres = waves.copy()
+
+        if s_matrix.downsampled_gpts != s_matrix.gpts:
+            waves.metadata["adjusted_antialias_cutoff_gpts"] = (
+                waves.antialias_cutoff_gpts
+            )
+
+            waves = waves.downsample(
+                gpts=s_matrix.downsampled_gpts,
+                normalization="intensity",
+            )
+
+        if s_matrix.store_on_host and s_matrix.device == "gpu":
+            waves = waves.to_cpu()
+
+        return waves.array, waves_fullres.array
+    
+    
+    def overlap_propagated_exit_waves_old(
+        self,
+        source,
+        max_batch_size="auto",
+    ):
+        """
+        Build the plane waves of the scattering matrix and propagate them through the
+        potential using the multislice algorithm.
+
+        Returns
+        -------
+        s_matrix_array : SMatrixArray
+            The built scattering matrix.
+        """
+        downsampled_gpts = self.downsampled_gpts
+        wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
+        wave_vector_blocks = self._wave_vector_blocks(
+            wave_vector_chunks, lazy=False
+        )
+
+        potential = self.potential
+        num_exit_planes = len(potential.exit_planes)
+        xp = get_array_module(potential._array)
+
+        source_abs_sq = xp.abs(source.array)**2
+
+        s_ep, s_n, s_m = source.shape
+        if s_ep != num_exit_planes:
+            raise ValueError()
+        if downsampled_gpts[0] != s_n or downsampled_gpts[1] != s_m:
+            raise ValueError()
+
+        coherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+        incoherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+
+        for i, _, s_matrix in self.generate_blocks(1):
+            s_matrix = s_matrix.item()
+            for start, stop in wave_vector_blocks:
+                
+                array = self._build_s_matrix(
+                    s_matrix, 
+                    slice(start, stop)
+                )
+                coherent_intensities[start:stop] += xp.abs(xp.sum(source.array[:,None,:,:] * array.conj(),axis=(0,2,3)))**2
+                incoherent_intensities[start:stop] += xp.sum(source_abs_sq[:,None,:,:] * xp.abs(array)**2,axis=(0,2,3))
+
+        dummy_probes = self.dummy_probes()
+        aperture = dummy_probes.aperture._evaluate_kernel(dummy_probes)
+        indices = xp.where(aperture>0)
+        
+        coherent_intensities_array = aperture.copy()
+        coherent_intensities_array[indices[0],indices[1]] = coherent_intensities - coherent_intensities.min()
+        
+        incoherent_intensities_array = aperture.copy()
+        incoherent_intensities_array[indices[0],indices[1]] = incoherent_intensities - incoherent_intensities.min()
+
+        return xp.asnumpy(coherent_intensities_array), xp.asnumpy(incoherent_intensities_array)

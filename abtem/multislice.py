@@ -541,6 +541,7 @@ def multislice_and_detect(
     detectors: Optional[list[BaseDetector]] = None,
     algorithm: FourierMultislice | RealSpaceMultislice = FourierMultislice(),
     return_backscattered: bool = False,
+    incoherent: bool = False,
     pbar: bool = False,
 ) -> BaseMeasurements | Waves | list[BaseMeasurements | Waves]:
     """
@@ -695,11 +696,17 @@ def multislice_and_detect(
 
     elif return_backscattered:
         # note: modifies backscattered waves in-place
-        _back_propagate_backscattered_waves(
-            measurements[-1],  # type: ignore
-            potential,
-            multislice_step,
-        )
+        if incoherent:
+            _back_propagate_backscattered_waves_incoherent(
+                measurements[-1],  # type: ignore
+                potential,
+            )
+        else:
+            _back_propagate_backscattered_waves(
+                measurements[-1],  # type: ignore
+                potential,
+                multislice_step,
+            )
 
     tqdm_pbar.close_if_exists()
 
@@ -754,7 +761,6 @@ def _back_propagate_backscattered_waves(
     This function runs the multislice in reverse for each backscattered wave summing
     them for a final backscattered wave result.
     """
-
     xp = get_array_module(backscattered_waves.device)
     potential_slices = [
         slice
@@ -782,6 +788,57 @@ def _back_propagate_backscattered_waves(
         )
         backscattered_waves[i].array += xp.conj(contribution_at_slice.array)
 
+    return backscattered_waves
+
+def _back_propagate_backscattered_waves_incoherent(
+    backscattered_waves: Waves,
+    potential: BasePotential,
+) -> Waves:
+    xp = get_array_module(backscattered_waves.device)
+
+    antialias_aperture = AntialiasAperture()
+    propagator = FresnelPropagator()
+
+    # 1. Setup potential slices
+    potential_slices = [
+        slice for _, config in _generate_potential_configurations(potential)
+        for slice in config.generate_slices()
+    ]
+    effective_slices = _aggregate_slices_by_exit_planes(
+        potential_slices, potential.exit_planes
+    )
+    num_slices = len(effective_slices)
+
+    # 2. Initialize the result array (Real-valued Intensity)
+    # We will store the final incoherent sum in the first entry (index 0)
+    incoherent_sum = xp.zeros(backscattered_waves[0].shape, dtype=xp.float32)
+
+    # 3. Iterate through each slice's backscattered contribution
+    for i in range(num_slices-1):
+        # The backscattered part created at slice i is stored in backscattered_waves[i+1]
+        print(round((100*i)/num_slices), "%")
+        psi_back = backscattered_waves[i + 1].copy()
+        
+        # 4. Propagate this specific contribution back to the top (slice 0)
+        # It must pass through all slices that are "above" it (indices i down to 0)
+        for j in range(i, -1, -1):
+            psi_back.array = xp.conj(psi_back.array)
+            psi_back = conventional_multislice_step(
+                psi_back,
+                effective_slices[j],
+                antialias_aperture=antialias_aperture,
+                propagator=propagator,
+            )
+            psi_back.array = xp.conj(psi_back.array)
+            
+        # 5. Add only the Intensity (|psi|^2) to our total
+        incoherent_sum += psi_back.diffraction_patterns(max_angle=None).array
+
+    # 6. Store the final intensity result back in index 0 for abTEM compatibility
+    # Note: Entry 0 is now Intensity, whereas the other entries are Waves.
+    backscattered_waves[0]._array[:] = 0
+    backscattered_waves[0].array += incoherent_sum
+    
     return backscattered_waves
 
 
