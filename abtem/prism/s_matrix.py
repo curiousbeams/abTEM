@@ -2295,17 +2295,23 @@ class ReciprocitySMatrix(SMatrix):
 
         potential = self.potential
         num_exit_planes = len(potential.exit_planes)
+        num_slices = potential.shape[0]
         xp = get_array_module(potential._array)
 
         s_ep, s_n, s_m = source.shape
         if s_ep != num_exit_planes:
             raise ValueError()
-        if downsampled_gpts[0] != s_n or downsampled_gpts[1] != s_m:
-            raise ValueError()
+        # if downsampled_gpts[0] != s_n or downsampled_gpts[1] != s_m:
+        #     raise ValueError()
 
         coherent_intensities = xp.zeros(len(self),dtype=xp.float32)
         coherent_intensities_complex = xp.zeros(len(self),dtype=xp.complex64)
         incoherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+
+        propagator = FresnelPropagator()
+        antialias_aperture = AntialiasAperture()
+
+        source_abs_sq = xp.abs(source.array)**2
 
         # Lets first get it to work with exit_planes = 1 for simplicity
         # effective_slices = _aggregate_slices_by_exit_planes(
@@ -2315,19 +2321,50 @@ class ReciprocitySMatrix(SMatrix):
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
             for start, stop in wave_vector_blocks:
-                previous_wave = None
-                for slice_index in range(num_exit_planes-1):
-                    array, array_fullres = self._build_s_matrix_per_slice(
-                        s_matrix, 
-                        slice_index,
-                        slice(start, stop),
-                        previous_waves=previous_wave,
-                        algorithm=self._algorithm,
-                    )
-                    previous_wave = array_fullres.copy()
+                wave_vectors = xp.asarray(s_matrix.wave_vectors[start:stop], dtype=xp.float32)
+                
+                # --- OPTIMIZATION 2: Initialize Waves Object ONCE per batch ---
+                # We generate the vacuum probe
+                array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
+                array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+                
+                waves = Waves(
+                    array,
+                    energy=s_matrix.energy,
+                    extent=s_matrix.extent,
+                    ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
+                )
 
-                    coherent_intensities_complex[start:stop] += xp.sum(source.array[slice_index,None,:,:] * array.conj(),axis=(1,2))
-                    incoherent_intensities[start:stop] += xp.sum(xp.abs(source.array[slice_index,None,:,:])**2 * xp.abs(array)**2,axis=(1,2))
+                for slice_index in range(num_slices):
+                    waves = conventional_multislice_step(
+                        waves, 
+                        s_matrix.potential[slice_index], 
+                        antialias_aperture=antialias_aperture,
+                        propagator=propagator,
+                    )
+                    # if s_matrix.downsampled_gpts != s_matrix.gpts:
+                    #     # Required metadata hack for downsampling to work
+                    #     waves.metadata["adjusted_antialias_cutoff_gpts"] = waves.antialias_cutoff_gpts
+                        
+                    #     # Downsample returns a NEW small array, leaving 'waves' high-res
+                    #     detected_waves = waves.downsample(
+                    #         gpts=s_matrix.downsampled_gpts,
+                    #         normalization="intensity",
+                    #     )
+                    #     array_for_overlap = detected_waves.array
+                    # else:
+                    array_for_overlap = waves.array
+                    
+                    if slice_index in potential.exit_planes:
+                        exit_plane_index = potential.exit_planes.index(slice_index)
+                        # coherent_intensities_complex[start:stop] += xp.einsum(
+                        #     'oyx,byx->b', 
+                        #     source.array[exit_plane_index,None,:,:], 
+                        #     array_for_overlap.conj()
+                        # )
+                        # print(source_abs_sq[exit_plane_index,None,:,:].shape)
+                        # print(source_abs_sq[exit_plane_index,None,:,:].shape)
+                        incoherent_intensities[start:stop] += xp.sum(source_abs_sq[exit_plane_index,None,:,:] * xp.abs(array_for_overlap)**2 * potential.array[slice_index, None, :, :]**2,axis=(1,2))
                     
             coherent_intensities = xp.abs(coherent_intensities_complex)**2
         dummy_probes = self.dummy_probes()
