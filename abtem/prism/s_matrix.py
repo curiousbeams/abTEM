@@ -2353,7 +2353,7 @@ class ReciprocitySMatrix(SMatrix):
                     #     )
                     #     array_for_overlap = detected_waves.array
                     # else:
-                    array_for_overlap = waves.array
+                    # array_for_overlap = waves.array
                     
                     if slice_index in potential.exit_planes:
                         exit_plane_index = potential.exit_planes.index(slice_index)
@@ -2362,9 +2362,8 @@ class ReciprocitySMatrix(SMatrix):
                         #     source.array[exit_plane_index,None,:,:], 
                         #     array_for_overlap.conj()
                         # )
-                        # print(source_abs_sq[exit_plane_index,None,:,:].shape)
-                        # print(source_abs_sq[exit_plane_index,None,:,:].shape)
-                        incoherent_intensities[start:stop] += xp.sum(source_abs_sq[exit_plane_index,None,:,:] * xp.abs(array_for_overlap)**2 * potential.array[slice_index, None, :, :]**2,axis=(1,2))
+                        coherent_intensities_complex[start:stop] += xp.sum(source.array[exit_plane_index,None,:,:] * waves.array.conj())
+                        incoherent_intensities[start:stop] += xp.sum(source_abs_sq[exit_plane_index,None,:,:] * xp.abs(waves.array)**2 * potential.array[slice_index, None, :, :]**2,axis=(1,2))
                     
             coherent_intensities = xp.abs(coherent_intensities_complex)**2
         dummy_probes = self.dummy_probes()
