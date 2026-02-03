@@ -130,6 +130,11 @@ def wrapped_crop_2d(
 
     return xp.concatenate([AB, CD], axis=-1)
 
+def small_angle_error(semiangle_cutoff:float) -> float:
+    alpha = semiangle_cutoff * 1e-3
+    sin_alpha = np.sin(alpha)
+    error = np.abs(sin_alpha-alpha) / sin_alpha
+    return error
 
 def prism_wave_vectors(
     cutoff: float,
