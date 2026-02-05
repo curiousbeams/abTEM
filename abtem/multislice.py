@@ -783,57 +783,6 @@ def _back_propagate_backscattered_waves(
 
     return backscattered_waves
 
-def _back_propagate_backscattered_waves_incoherent(
-    backscattered_waves: Waves,
-    potential: BasePotential,
-) -> Waves:
-    xp = get_array_module(backscattered_waves.device)
-
-    antialias_aperture = AntialiasAperture()
-    propagator = FresnelPropagator()
-
-    # 1. Setup potential slices
-    potential_slices = [
-        slice for _, config in _generate_potential_configurations(potential)
-        for slice in config.generate_slices()
-    ]
-    effective_slices = _aggregate_slices_by_exit_planes(
-        potential_slices, potential.exit_planes
-    )
-    num_slices = len(effective_slices)
-
-    # 2. Initialize the result array (Real-valued Intensity)
-    # We will store the final incoherent sum in the first entry (index 0)
-    incoherent_sum = xp.zeros(backscattered_waves[0].shape, dtype=xp.float32)
-
-    # 3. Iterate through each slice's backscattered contribution
-    for i in range(num_slices-1):
-        # The backscattered part created at slice i is stored in backscattered_waves[i+1]
-        print(round((100*i)/num_slices), "%")
-        psi_back = backscattered_waves[i + 1].copy()
-        
-        # 4. Propagate this specific contribution back to the top (slice 0)
-        # It must pass through all slices that are "above" it (indices i down to 0)
-        for j in range(i, -1, -1):
-            psi_back.array = xp.conj(psi_back.array)
-            psi_back = conventional_multislice_step(
-                psi_back,
-                effective_slices[j],
-                antialias_aperture=antialias_aperture,
-                propagator=propagator,
-            )
-            psi_back.array = xp.conj(psi_back.array)
-            
-        # 5. Add only the Intensity (|psi|^2) to our total
-        incoherent_sum += psi_back.diffraction_patterns(max_angle=None).array
-
-    # 6. Store the final intensity result back in index 0 for abTEM compatibility
-    # Note: Entry 0 is now Intensity, whereas the other entries are Waves.
-    backscattered_waves[0]._array[:] = 0
-    backscattered_waves[0].array += incoherent_sum
-    
-    return backscattered_waves
-
 
 def transition_potential_multislice_and_detect(
     waves: Waves,
