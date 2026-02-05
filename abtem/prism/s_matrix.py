@@ -2288,12 +2288,16 @@ class EBSDReciprocitySMatrix(SMatrix):
                             s_matrix.potential[slice_index],
                             antialias_aperture=antialias_aperture,
                             propagator=propagator,
+                            order=2
                         )
 
                         if slice_index in potential.exit_planes:
                             exit_plane_index = potential.exit_planes.index(slice_index)
                             coherent_intensities_complex[start:stop] += xp.sum(
-                                source.array[exit_plane_index,None,:,:] * waves.array.conj()
+                                source.array[exit_plane_index,None,:,:] *
+                                waves.array.conj() *
+                                potential.array[slice_index, None, :, :],
+                                axis=(1,2)
                             )
                             incoherent_intensities[start:stop] += xp.sum(
                                 source_abs_sq[exit_plane_index,None,:,:] *
