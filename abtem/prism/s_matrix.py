@@ -13,6 +13,7 @@ import numpy as np
 from ase import Atoms
 from dask.graph_manipulation import wait_on
 
+from abtem.antialias import AntialiasAperture
 from abtem.array import ArrayObject, ComputableList, validate_lazy
 from abtem.core import config
 from abtem.core.axes import (
@@ -47,13 +48,24 @@ from abtem.detectors import (
     validate_detectors,
 )
 from abtem.measurements import BaseMeasurements
-from abtem.multislice import allocate_multislice_measurements, multislice_and_detect, RealSpaceMultislice, FourierMultislice, conventional_multislice_step, FresnelPropagator
+from abtem.multislice import (
+    FresnelPropagator,
+    allocate_multislice_measurements,
+    conventional_multislice_step,
+    multislice_and_detect,
+)
 from abtem.potentials.iam import BasePotential, validate_potential
-from abtem.prism.utils import batch_crop_2d, minimum_crop, plane_waves, wrapped_crop_2d, small_angle_error
+from abtem.prism.utils import (
+    batch_crop_2d,
+    minimum_crop,
+    plane_waves,
+    small_angle_error,
+    wrapped_crop_2d,
+)
 from abtem.scan import BaseScan, GridScan, validate_scan
 from abtem.transfer import CTF
 from abtem.waves import BaseWaves, Probe, Waves, _antialias_cutoff_gpts
-from abtem.antialias import AntialiasAperture
+
 
 def _extract_measurement(array, index):
     if array.size == 0:
@@ -2181,8 +2193,10 @@ class SMatrix(BaseSMatrix, Ensemble, CopyMixin, EqualityMixin):
             ctf=ctf,
         )
 
+
 class EBSDReciprocitySMatrix(SMatrix):
-    def __init__(self,
+    def __init__(
+        self,
         semiangle_cutoff: float,
         energy: float,
         potential: Atoms | BasePotential = None,
@@ -2192,33 +2206,40 @@ class EBSDReciprocitySMatrix(SMatrix):
         interpolation: int | tuple[int, int] = 1,
         device: str = None,
         store_on_host: bool = False,
-        algorithm: FourierMultislice | RealSpaceMultislice = FourierMultislice(),
+        wave_vectors: np.ndarray | None = None,
     ):
 
         approx_error = small_angle_error(semiangle_cutoff)
-        if approx_error > 0.1:
+        if approx_error > 0.05:
             warnings.warn(
-                    f"The small-angle approximation error of {approx_error:.2%} "
-                    "is larger than 10%."
-                )
+                f"The small-angle approximation error of {approx_error:.2%} "
+                "is larger than 5%."
+            )
+
+        if wave_vectors is not None:
+            if wave_vectors.ndim != 2 or wave_vectors.shape[1] != 2:
+                raise ValueError("wave_vectors must be shape (N, 2)")
 
         super().__init__(
-            semiangle_cutoff = semiangle_cutoff,
-            energy = energy,
-            potential = potential,
-            gpts = gpts,
-            sampling = sampling,
-            extent = extent,
-            interpolation = interpolation,
-            downsample = False,
-            device = device,
-            store_on_host = store_on_host
+            semiangle_cutoff=semiangle_cutoff,
+            energy=energy,
+            potential=potential,
+            gpts=gpts,
+            sampling=sampling,
+            extent=extent,
+            interpolation=interpolation,
+            downsample=False,
+            device=device,
+            store_on_host=store_on_host,
         )
-        self._algorithm = algorithm
+        self._explicit_wave_vectors = wave_vectors
 
     @property
-    def algorithm(self):
-        return self._algorithm
+    def wave_vectors(self) -> np.ndarray:
+        if self._explicit_wave_vectors is not None:
+            xp = get_array_module(self.device)
+            return xp.asarray(self._explicit_wave_vectors)
+        return super().wave_vectors
 
     @staticmethod
     def _s_matrix(*args, potential_partial, **kwargs):
@@ -2242,9 +2263,7 @@ class EBSDReciprocitySMatrix(SMatrix):
         """
 
         wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
-        wave_vector_blocks = self._wave_vector_blocks(
-            wave_vector_chunks, lazy=False
-        )
+        wave_vector_blocks = self._wave_vector_blocks(wave_vector_chunks, lazy=False)
 
         potential = self.potential
         num_exit_planes = len(potential.exit_planes)
@@ -2255,21 +2274,24 @@ class EBSDReciprocitySMatrix(SMatrix):
         if s_ep != num_exit_planes:
             raise ValueError()
 
-        coherent_intensities_complex = xp.zeros(len(self),dtype=xp.complex64)
-        incoherent_intensities = xp.zeros(len(self),dtype=xp.float32)
+        coherent_intensities_complex = xp.zeros(len(self), dtype=xp.complex64)
+        incoherent_intensities = xp.zeros(len(self), dtype=xp.float32)
 
         propagator = FresnelPropagator()
         antialias_aperture = AntialiasAperture()
 
-        source_abs_sq = xp.abs(source.array)**2
+        source_abs_sq = xp.abs(source.array) ** 2
 
-        pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=True)
+        pbar = config.get("diagnostics.task_progress", False)
+        pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
 
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
             try:
                 for start, stop in wave_vector_blocks:
-                    wave_vectors = xp.asarray(s_matrix.wave_vectors[start:stop], dtype=xp.float32)
+                    wave_vectors = xp.asarray(
+                        s_matrix.wave_vectors[start:stop], dtype=xp.float32
+                    )
 
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
                     array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
@@ -2282,45 +2304,32 @@ class EBSDReciprocitySMatrix(SMatrix):
                     )
 
                     for slice_index in range(num_slices):
-
                         waves = conventional_multislice_step(
                             waves,
                             s_matrix.potential[slice_index],
                             antialias_aperture=antialias_aperture,
                             propagator=propagator,
-                            order=2
+                            order=2,
                         )
 
                         if slice_index in potential.exit_planes:
                             exit_plane_index = potential.exit_planes.index(slice_index)
                             coherent_intensities_complex[start:stop] += xp.sum(
-                                source.array[exit_plane_index,None,:,:] *
-                                waves.array.conj() *
-                                potential.array[slice_index, None, :, :],
-                                axis=(1,2)
+                                source.array[exit_plane_index, None, :, :]
+                                * waves.array.conj()
+                                * potential.array[slice_index, None, :, :],
+                                axis=(1, 2),
                             )
                             incoherent_intensities[start:stop] += xp.sum(
-                                source_abs_sq[exit_plane_index,None,:,:] *
-                                xp.abs(waves.array)**2 *
-                                potential.array[slice_index, None, :, :]**2,
-                                axis=(1,2)
+                                source_abs_sq[exit_plane_index, None, :, :]
+                                * xp.abs(waves.array) ** 2
+                                * potential.array[slice_index, None, :, :] ** 2,
+                                axis=(1, 2),
                             )
-                    pbar.update_if_exists(stop-start)
+                    pbar.update_if_exists(stop - start)
             finally:
                 pbar.close_if_exists()
 
-        coherent_intensities = xp.abs(coherent_intensities_complex)**2
+        coherent_intensities = xp.abs(coherent_intensities_complex) ** 2
 
         return coherent_intensities, incoherent_intensities
-        
-        # dummy_probes = self.dummy_probes()
-        # aperture = dummy_probes.aperture._evaluate_kernel(dummy_probes)
-        # indices = xp.where(aperture>0)
-        
-        # coherent_intensities_array = aperture.copy()
-        # coherent_intensities_array[indices[0],indices[1]] = coherent_intensities - coherent_intensities.min()
-        
-        # incoherent_intensities_array = aperture.copy()
-        # incoherent_intensities_array[indices[0],indices[1]] = incoherent_intensities - incoherent_intensities.min()
-
-        # return xp.asnumpy(coherent_intensities_array), xp.asnumpy(incoherent_intensities_array)
