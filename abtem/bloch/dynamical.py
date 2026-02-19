@@ -1118,6 +1118,8 @@ def calculate_wave_functions(amplitudes, g_vec, extent, gpts, thicknesses):
     y = xp.linspace(0, extent[1], gpts[1], endpoint=False)
     z = xp.array(thicknesses)
 
+    g_vec = xp.asarray(g_vec)
+
     basis = plane_wave_basis(g_vec, x, y, z)
     wave_functions = reduce_plane_wave_expansion(amplitudes, basis)
     return wave_functions
@@ -2237,3 +2239,5 @@ class BlochwaveEnsemble(Ensemble, CopyMixin):
         )
 
         return result
+
+    
