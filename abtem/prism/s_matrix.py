@@ -2359,15 +2359,15 @@ class EBSDReciprocitySMatrix(SMatrix):
                                 order=order,
                             )
 
-                            if slice_index in potential.exit_planes:
+                            if slice_index in exit_plane_lookup:
                                 if slice_index*slice_thickness >= range_limit[0] and slice_index*slice_thickness <= range_limit[1]:
                                     exit_plane_index = exit_plane_lookup[slice_index]
                                     K = waves.array.shape[0]
                                     W_flat = waves.array.reshape(K, -1)
+                                    W_flat_conj = W_flat.conj()
+                                    coherent_intensities_complex[start:stop] += (W_flat_conj @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
 
-                                    coherent_intensities_complex[start:stop] += (W_flat.conj() @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
-
-                                    intensity_flat = (W_flat * W_flat.conj()).real
+                                    intensity_flat = (W_flat * W_flat_conj).real
                                     incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
 
                         pbar.update_if_exists(stop - start)
