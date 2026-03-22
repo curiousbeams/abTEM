@@ -2251,11 +2251,31 @@ class EBSDReciprocitySMatrix(SMatrix):
         self,
         source,
         max_batch_size="auto",
+        order: int = 1,
+        range_limit: tuple[float, float] | None = None,
+        BSE_energies: np.ndarray | None = None, 
+        BSE_energies_weights: np.ndarray | None = None
     ):
         """
         Build the plane waves of the scattering matrix and propagate them through the
         potential using the multislice algorithm.
 
+        Parameters
+        ----------
+        source:
+            The incident beam wavefunction at each slice
+        max_batch_size:
+            how many wavevectors are computed per batch. 
+            Used to save memory
+        range_limit, optional:
+            Range where only BSE from this range of depth count towards total
+        BSE_energies, optional:
+            A list of energies to account for in the backscatter simulation for inelastic scattering
+        BSE_energies_weights, optional:
+            An ancompaniying list for BSE_energies for the weighted sum for energies. 
+            If BSE_energies is supplied but BSE_energies_weights is None all weights 
+            will be equal. 
+            Weights can be chosen arbitrarily, this function will normalize them.
         Returns
         -------
         s_matrix_array : SMatrixArray
@@ -2268,7 +2288,25 @@ class EBSDReciprocitySMatrix(SMatrix):
         potential = self.potential
         num_exit_planes = len(potential.exit_planes)
         num_slices = potential.shape[0]
+
         xp = get_array_module(self._device)
+
+        slice_thickness = potential.slice_thickness[0]
+        sample_thickness = slice_thickness * num_slices
+        if range_limit is None:
+            range_limit = (0, sample_thickness)
+
+        if BSE_energies is None:
+            BSE_energies = xp.array([self.energy])
+        elif xp.max(BSE_energies) > self.energy:
+            raise ValueError("BSE energy cannot be higher than probe energy")
+        if BSE_energies_weights is None:
+            BSE_energies_weights = xp.ones(len(BSE_energies)) / len(BSE_energies)
+        else:
+            if len(BSE_energies_weights) != len(BSE_energies):
+                raise ValueError("Supplied BSE_energies_weights length does not match BSE_energies")
+            # Normalize 
+            BSE_energies_weights /= BSE_energies_weights.sum()
 
         s_ep, s_n, s_m = source.shape
         if s_ep != num_exit_planes:
@@ -2280,7 +2318,14 @@ class EBSDReciprocitySMatrix(SMatrix):
         propagator = FresnelPropagator()
         antialias_aperture = AntialiasAperture()
 
-        source_abs_sq = xp.abs(source.array) ** 2
+        exit_plane_stepsize = potential.exit_planes[1] - potential.exit_planes[0]
+        coherent_prefactor = source.array[1:] * potential.array[::exit_plane_stepsize]
+        coherent_prefactor = coherent_prefactor.reshape(num_exit_planes-1, -1)
+
+        incoherent_prefactor = xp.abs(source.array[1:]) ** 2 * potential.array[::exit_plane_stepsize] ** 2
+        incoherent_prefactor = incoherent_prefactor.reshape(num_exit_planes-1, -1)
+
+        exit_plane_lookup = {val: i for i, val in enumerate(potential.exit_planes)}
 
         pbar = config.get("diagnostics.task_progress", False)
         pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
@@ -2295,38 +2340,35 @@ class EBSDReciprocitySMatrix(SMatrix):
 
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
                     array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
-
-                    waves = Waves(
-                        array,
-                        energy=s_matrix.energy,
-                        extent=s_matrix.extent,
-                        ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
-                    )
-
-                    for slice_index in range(num_slices):
-                        waves = conventional_multislice_step(
-                            waves,
-                            s_matrix.potential[slice_index],
-                            antialias_aperture=antialias_aperture,
-                            propagator=propagator,
-                            order=2,
+                    for j, bse_energy in enumerate(BSE_energies):
+                        waves = Waves(
+                            array,
+                            energy=bse_energy,
+                            extent=s_matrix.extent,
+                            ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
                         )
 
-                        if slice_index in potential.exit_planes:
-                            exit_plane_index = potential.exit_planes.index(slice_index)
-                            coherent_intensities_complex[start:stop] += xp.sum(
-                                source.array[exit_plane_index, None, :, :]
-                                * waves.array.conj()
-                                * potential.array[slice_index, None, :, :],
-                                axis=(1, 2),
+                        for slice_index in range(num_slices):
+                            if slice_index*slice_thickness > range_limit[1]:
+                                break
+                            waves = conventional_multislice_step(
+                                waves,
+                                s_matrix.potential[slice_index],
+                                antialias_aperture=antialias_aperture,
+                                propagator=propagator,
+                                order=order,
                             )
-                            incoherent_intensities[start:stop] += xp.sum(
-                                source_abs_sq[exit_plane_index, None, :, :]
-                                * xp.abs(waves.array) ** 2
-                                * potential.array[slice_index, None, :, :] ** 2,
-                                axis=(1, 2),
-                            )
-                    pbar.update_if_exists(stop - start)
+
+                            if slice_index in potential.exit_planes:
+                                if slice_index*slice_thickness >= range_limit[0] and slice_index*slice_thickness <= range_limit[1]:
+                                    exit_plane_index = exit_plane_lookup[slice_index]
+                                    K = waves.array.shape[0]
+                                    W_flat = waves.array.reshape(K, -1)
+                                    
+                                    coherent_intensities_complex[start:stop] += W_flat.conj() @ coherent_prefactor[exit_plane_index-1] * BSE_energies_weights[j]
+                                    incoherent_intensities[start:stop] += xp.abs(W_flat)**2 @ incoherent_intensities[exit_plane_index-1] * BSE_energies_weights[j]
+
+                        pbar.update_if_exists(stop - start)
             finally:
                 pbar.close_if_exists()
 
