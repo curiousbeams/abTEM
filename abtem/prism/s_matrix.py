@@ -2329,7 +2329,6 @@ class EBSDReciprocitySMatrix(SMatrix):
 
         pbar = config.get("diagnostics.task_progress", False)
         pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
-
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
             try:
@@ -2340,6 +2339,7 @@ class EBSDReciprocitySMatrix(SMatrix):
 
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
                     array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+
                     for j, bse_energy in enumerate(BSE_energies):
                         waves = Waves(
                             array,
@@ -2353,7 +2353,7 @@ class EBSDReciprocitySMatrix(SMatrix):
                                 break
                             waves = conventional_multislice_step(
                                 waves,
-                                s_matrix.potential[slice_index],
+                                potential[slice_index],
                                 antialias_aperture=antialias_aperture,
                                 propagator=propagator,
                                 order=order,
@@ -2362,13 +2362,17 @@ class EBSDReciprocitySMatrix(SMatrix):
                             if slice_index in exit_plane_lookup:
                                 if slice_index*slice_thickness >= range_limit[0] and slice_index*slice_thickness <= range_limit[1]:
                                     exit_plane_index = exit_plane_lookup[slice_index]
-                                    K = waves.array.shape[0]
+                                    shape = waves.array.shape
+                                    K = shape[0]
                                     W_flat = waves.array.reshape(K, -1)
                                     W_flat_conj = W_flat.conj()
                                     coherent_intensities_complex[start:stop] += (W_flat_conj @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
 
                                     intensity_flat = (W_flat * W_flat_conj).real
-                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
+
+                                    wave_norm_sq = xp.sum((intensity_flat**2),axis=1)
+                                    source_norm_sq = xp.sum((incoherent_prefactor[exit_plane_index-1]**2))
+                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j] / xp.sqrt(wave_norm_sq*source_norm_sq)
 
                         pbar.update_if_exists(stop - start)
             finally:
