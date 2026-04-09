@@ -2254,7 +2254,8 @@ class EBSDReciprocitySMatrix(SMatrix):
         order: int = 1,
         range_limit: tuple[float, float] | None = None,
         BSE_energies: np.ndarray | None = None, 
-        BSE_energies_weights: np.ndarray | None = None
+        BSE_energies_weights: np.ndarray | None = None,
+        pbar: bool = None
     ):
         """
         Build the plane waves of the scattering matrix and propagate them through the
@@ -2327,7 +2328,8 @@ class EBSDReciprocitySMatrix(SMatrix):
 
         exit_plane_lookup = {val: i for i, val in enumerate(potential.exit_planes)}
 
-        pbar = config.get("diagnostics.task_progress", False)
+        if pbar is None:
+            pbar = config.get("local_diagnostics.task_level_progress", False)
         pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
@@ -2368,13 +2370,19 @@ class EBSDReciprocitySMatrix(SMatrix):
                                     W_flat_conj = W_flat.conj()
                                     coherent_intensities_complex[start:stop] += (W_flat_conj @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
 
-                                    intensity_flat = (W_flat * W_flat_conj).real
+                                    intensity_flat = xp.abs(W_flat) ** 2
 
                                     wave_norm_sq = xp.sum((intensity_flat**2),axis=1)
                                     source_norm_sq = xp.sum((incoherent_prefactor[exit_plane_index-1]**2))
-                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j] / xp.sqrt(wave_norm_sq*source_norm_sq)
-
+                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j] / xp.sqrt(wave_norm_sq*source_norm_sq) / (num_exit_planes-1)
                         pbar.update_if_exists(stop - start)
+                        wave_fft = xp.fft.fft2(waves.array, axes=(-2, -1))
+                        total_amplitude = xp.sum(xp.abs(wave_fft)**2, axis=(-2, -1))
+                        if xp.min(total_amplitude) < 0.90:
+                            lost_percent = 100 * (1 - np.min(total_amplitude))
+                            warnings.warn(
+                                f"The anti-alias aperture removed {lost_percent:.2f}% total amplitude for at least one wavevector"
+                            )
             finally:
                 pbar.close_if_exists()
 
