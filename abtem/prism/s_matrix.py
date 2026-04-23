@@ -27,7 +27,7 @@ from abtem.core.backend import copy_to_device, cp, get_array_module, validate_de
 from abtem.core.chunks import Chunks, chunk_ranges, equal_sized_chunks, validate_chunks
 from abtem.core.complex import complex_exponential
 from abtem.core.diagnostics import TqdmWrapper
-from abtem.core.energy import Accelerator
+from abtem.core.energy import Accelerator, energy2sigma
 from abtem.core.ensemble import Ensemble, _wrap_with_array
 from abtem.core.grid import Grid, GridUndefinedError
 from abtem.core.utils import (
@@ -2318,12 +2318,13 @@ class EBSDReciprocitySMatrix(SMatrix):
 
         propagator = FresnelPropagator()
         antialias_aperture = AntialiasAperture()
+        sigma = energy2sigma(self.energy) #should be moved into BSE_energies loop
 
         exit_plane_stepsize = potential.exit_planes[1] - potential.exit_planes[0]
-        coherent_prefactor = source.array[1:] * potential.array[::exit_plane_stepsize]
+        coherent_prefactor = source.array[1:] * sigma * potential.array[::exit_plane_stepsize] 
         coherent_prefactor = coherent_prefactor.reshape(num_exit_planes-1, -1)
 
-        incoherent_prefactor = xp.abs(source.array[1:]) ** 2 * potential.array[::exit_plane_stepsize] ** 2
+        incoherent_prefactor = xp.abs(source.array[1:]) ** 2 * (sigma * potential.array[::exit_plane_stepsize]) ** 2 / np.prod(source.array[1:].shape[-2:])
         incoherent_prefactor = incoherent_prefactor.reshape(num_exit_planes-1, -1)
 
         exit_plane_lookup = {val: i for i, val in enumerate(potential.exit_planes)}
@@ -2331,6 +2332,7 @@ class EBSDReciprocitySMatrix(SMatrix):
         if pbar is None:
             pbar = config.get("local_diagnostics.task_level_progress", False)
         pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
+        
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
             try:
@@ -2338,6 +2340,8 @@ class EBSDReciprocitySMatrix(SMatrix):
                     wave_vectors = xp.asarray(
                         s_matrix.wave_vectors[start:stop], dtype=xp.float32
                     )
+                    waves_norm_total = xp.zeros(wave_vectors.shape[0])
+                    source_norm_total = 0.0
 
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
                     array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
@@ -2372,17 +2376,20 @@ class EBSDReciprocitySMatrix(SMatrix):
 
                                     intensity_flat = xp.abs(W_flat) ** 2
 
-                                    wave_norm_sq = xp.sum((intensity_flat**2),axis=1)
+                                    wave_norm_sq = xp.sum((intensity_flat**2), axis=1)
+                                    waves_norm_total += wave_norm_sq * BSE_energies_weights[j]
                                     source_norm_sq = xp.sum((incoherent_prefactor[exit_plane_index-1]**2))
-                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j] / xp.sqrt(wave_norm_sq*source_norm_sq) / (num_exit_planes-1)
+                                    source_norm_total += source_norm_sq * BSE_energies_weights[j]
+                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
                         pbar.update_if_exists(stop - start)
                         wave_fft = xp.fft.fft2(waves.array, axes=(-2, -1))
                         total_amplitude = xp.sum(xp.abs(wave_fft)**2, axis=(-2, -1))
-                        if xp.min(total_amplitude) < 0.90:
+                        if xp.min(total_amplitude) < 0.95:
                             lost_percent = 100 * (1 - np.min(total_amplitude))
                             warnings.warn(
                                 f"The anti-alias aperture removed {lost_percent:.2f}% total amplitude for at least one wavevector"
                             )
+                        incoherent_intensities[start:stop] /= xp.sqrt(waves_norm_total * source_norm_total)
             finally:
                 pbar.close_if_exists()
 
