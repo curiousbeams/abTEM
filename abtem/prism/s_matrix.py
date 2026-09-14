@@ -65,6 +65,7 @@ from abtem.prism.utils import (
 from abtem.scan import BaseScan, GridScan, validate_scan
 from abtem.transfer import CTF
 from abtem.waves import BaseWaves, Probe, Waves, _antialias_cutoff_gpts
+from abtem.finite_difference import multislice_step, LaplaceOperator
 
 
 def _extract_measurement(array, index):
@@ -2247,40 +2248,208 @@ class EBSDReciprocitySMatrix(SMatrix):
         s_matrix = EBSDReciprocitySMatrix(potential=potential, **kwargs)
         return _wrap_with_array(s_matrix)
 
-    def overlap_propagated_exit_waves(
+    # def overlap_propagated_exit_waves(
+    #     self,
+    #     source,
+    #     max_batch_size="auto",
+    #     order: int = 1,
+    #     range_limit: tuple[float, float] | None = None,
+    #     BSE_energies: np.ndarray | None = None, 
+    #     BSE_energies_weights: np.ndarray | None = None,
+    #     realspace_method: bool = False,
+    #     pbar: bool = None
+    # ):
+    #     """
+    #     Build the plane waves of the scattering matrix and propagate them through the
+    #     potential using the multislice algorithm.
+
+    #     Parameters
+    #     ----------
+    #     source:
+    #         The incident beam wavefunction at each slice
+    #     max_batch_size:
+    #         how many wavevectors are computed per batch. 
+    #         Used to save memory
+    #     range_limit, optional:
+    #         Range where only BSE from this range of depth count towards total
+    #     BSE_energies, optional:
+    #         A list of energies to account for in the backscatter simulation for inelastic scattering
+    #     BSE_energies_weights, optional:
+    #         An ancompaniying list for BSE_energies for the weighted sum for energies. 
+    #         If BSE_energies is supplied but BSE_energies_weights is None all weights 
+    #         will be equal. 
+    #         Weights can be chosen arbitrarily, this function will normalize them.
+    #     Returns
+    #     -------
+    #     s_matrix_array : SMatrixArray
+    #         The built scattering matrix.
+    #     """
+
+    #     wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
+    #     wave_vector_blocks = self._wave_vector_blocks(wave_vector_chunks, lazy=False)
+
+    #     potential = self.potential
+    #     num_exit_planes = len(potential.exit_planes)
+    #     num_slices = potential.shape[0]
+
+    #     xp = get_array_module(self._device)
+
+    #     slice_thickness = potential.slice_thickness[0]
+    #     sample_thickness = slice_thickness * num_slices
+    #     if range_limit is None:
+    #         range_limit = (0, sample_thickness)
+
+    #     if BSE_energies is None:
+    #         BSE_energies = xp.array([self.energy])
+    #     elif xp.max(BSE_energies) > self.energy:
+    #         raise ValueError("BSE energy cannot be higher than probe energy")
+    #     if BSE_energies_weights is None:
+    #         BSE_energies_weights = xp.ones(len(BSE_energies)) / len(BSE_energies)
+    #     else:
+    #         if len(BSE_energies_weights) != len(BSE_energies):
+    #             raise ValueError("Supplied BSE_energies_weights length does not match BSE_energies")
+    #         # Normalize 
+    #         BSE_energies_weights /= BSE_energies_weights.sum()
+
+    #     s_ep, s_n, s_m = source.shape
+    #     if s_ep != num_exit_planes:
+    #         raise ValueError()
+
+    #     coherent_intensities_complex = xp.zeros(len(self), dtype=xp.complex64)
+    #     incoherent_intensities = xp.zeros(len(self), dtype=xp.float32)
+
+    #     propagator = FresnelPropagator()
+    #     antialias_aperture = AntialiasAperture()
+    #     sigma = energy2sigma(self.energy) #should be moved into BSE_energies loop
+
+    #     exit_plane_stepsize = potential.exit_planes[1] - potential.exit_planes[0]
+    #     coherent_prefactor = source.array[1:] * sigma * potential.array[::exit_plane_stepsize] 
+    #     coherent_prefactor = coherent_prefactor.reshape(num_exit_planes-1, -1)
+
+    #     incoherent_prefactor = xp.abs(source.array[1:]) ** 2 * (sigma * potential.array[::exit_plane_stepsize]) ** 2 / np.prod(source.array[1:].shape[-2:])
+    #     incoherent_prefactor = incoherent_prefactor.reshape(num_exit_planes-1, -1)
+
+    #     exit_plane_lookup = {val: i for i, val in enumerate(potential.exit_planes)}
+
+    #     laplace = None
+
+    #     if realspace_method:
+    #         laplace = LaplaceOperator(6)
+
+    #     if pbar is None:
+    #         pbar = config.get("local_diagnostics.task_level_progress", False)
+    #     pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
+        
+    #     for i, _, s_matrix in self.generate_blocks(1):
+    #         s_matrix = s_matrix.item()
+    #         try:
+    #             for start, stop in wave_vector_blocks:
+    #                 wave_vectors = xp.asarray(
+    #                     s_matrix.wave_vectors[start:stop], dtype=xp.float32
+    #                 )
+    #                 waves_norm_total = xp.zeros(wave_vectors.shape[0])
+    #                 source_norm_total = 0.0
+
+    #                 array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
+    #                 array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+
+    #                 for j, bse_energy in enumerate(BSE_energies):
+    #                     waves = Waves(
+    #                         array,
+    #                         energy=bse_energy,
+    #                         extent=s_matrix.extent,
+    #                         ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
+    #                     )
+
+    #                     for slice_index in range(num_slices):
+    #                         if slice_index*slice_thickness > range_limit[1]:
+    #                             break
+    #                         if realspace_method:
+    #                             if slice_index > num_slices - 2:
+    #                                 next_slice = None
+    #                             else:
+    #                                 next_slice = potential[slice_index+1]
+    #                             waves = multislice_step(
+    #                                 waves, 
+    #                                 potential[slice_index],
+    #                                 next_slice=next_slice,
+    #                                 laplace=laplace,
+    #                                 order=4,
+    #                                 fully_corrected=True
+    #                             )
+    #                         else:
+    #                             waves = conventional_multislice_step(
+    #                                 waves,
+    #                                 potential[slice_index],
+    #                                 antialias_aperture=antialias_aperture,
+    #                                 propagator=propagator,
+    #                                 order=order,
+    #                             )
+
+    #                         if slice_index in exit_plane_lookup:
+    #                             if slice_index*slice_thickness >= range_limit[0] and slice_index*slice_thickness <= range_limit[1]:
+    #                                 exit_plane_index = exit_plane_lookup[slice_index]
+    #                                 shape = waves.array.shape
+    #                                 K = shape[0]
+    #                                 W_flat = waves.array.reshape(K, -1)
+    #                                 W_flat_conj = W_flat.conj()
+    #                                 coherent_intensities_complex[start:stop] += (W_flat_conj @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
+
+    #                                 intensity_flat = xp.abs(W_flat) ** 2
+
+    #                                 wave_norm_sq = xp.sum((intensity_flat**2), axis=1)
+    #                                 waves_norm_total += wave_norm_sq * BSE_energies_weights[j]
+    #                                 source_norm_sq = xp.sum((incoherent_prefactor[exit_plane_index-1]**2))
+    #                                 source_norm_total += source_norm_sq * BSE_energies_weights[j]
+    #                                 incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
+    #                     pbar.update_if_exists(stop - start)
+    #                     wave_fft = xp.fft.fft2(waves.array, axes=(-2, -1))
+    #                     total_amplitude = xp.sum(xp.abs(wave_fft)**2, axis=(-2, -1))
+                        
+    #                     if xp.min(total_amplitude) < 0.95:
+    #                         lost_percent = 100 * (1 - np.min(total_amplitude))
+    #                         warnings.warn(
+    #                             f"The anti-alias aperture removed {lost_percent:.2f}% total amplitude for at least one wavevector"
+    #                         )
+    #                     incoherent_intensities[start:stop] /= xp.sqrt(waves_norm_total * source_norm_total)
+    #         finally:
+    #             pbar.close_if_exists()
+
+    #     coherent_intensities = xp.abs(coherent_intensities_complex) ** 2
+
+    #     return coherent_intensities, incoherent_intensities
+
+    def overlap_propagated_exit_waves_simple(
         self,
         source,
         max_batch_size="auto",
         order: int = 1,
         range_limit: tuple[float, float] | None = None,
-        BSE_energies: np.ndarray | None = None, 
-        BSE_energies_weights: np.ndarray | None = None,
-        pbar: bool = None
+        pbar: bool = None,
+        multiply_potential: bool = True,
+        coherent: bool = False,
     ):
         """
         Build the plane waves of the scattering matrix and propagate them through the
-        potential using the multislice algorithm.
+        potential using the multislice algorithm to compute EBSD/Kikuchi patterns via reciprocity.
 
         Parameters
         ----------
         source:
-            The incident beam wavefunction at each slice
+            The incident beam wavefunction at each slice.
         max_batch_size:
-            how many wavevectors are computed per batch. 
-            Used to save memory
+            How many wavevectors are computed per batch. Used to save memory.
         range_limit, optional:
-            Range where only BSE from this range of depth count towards total
+            Tuple of (min_depth, max_depth). Only slices within this range 
+            contribute to the total backscattered intensity.
         BSE_energies, optional:
-            A list of energies to account for in the backscatter simulation for inelastic scattering
+            Energies to account for in backscatter simulation (inelastic).
         BSE_energies_weights, optional:
-            An ancompaniying list for BSE_energies for the weighted sum for energies. 
-            If BSE_energies is supplied but BSE_energies_weights is None all weights 
-            will be equal. 
-            Weights can be chosen arbitrarily, this function will normalize them.
+            Accompanying weights for BSE_energies.
         Returns
         -------
-        s_matrix_array : SMatrixArray
-            The built scattering matrix.
+        incoherent_intensities : array
+            The 1D array of EBSD pattern intensities corresponding to the wave vectors.
         """
 
         wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
@@ -2293,46 +2462,29 @@ class EBSDReciprocitySMatrix(SMatrix):
         xp = get_array_module(self._device)
 
         slice_thickness = potential.slice_thickness[0]
-        sample_thickness = slice_thickness * num_slices
-        if range_limit is None:
-            range_limit = (0, sample_thickness)
-
-        if BSE_energies is None:
-            BSE_energies = xp.array([self.energy])
-        elif xp.max(BSE_energies) > self.energy:
-            raise ValueError("BSE energy cannot be higher than probe energy")
-        if BSE_energies_weights is None:
-            BSE_energies_weights = xp.ones(len(BSE_energies)) / len(BSE_energies)
-        else:
-            if len(BSE_energies_weights) != len(BSE_energies):
-                raise ValueError("Supplied BSE_energies_weights length does not match BSE_energies")
-            # Normalize 
-            BSE_energies_weights /= BSE_energies_weights.sum()
 
         s_ep, s_n, s_m = source.shape
         if s_ep != num_exit_planes:
-            raise ValueError()
+            raise ValueError(f"Source exit planes ({s_ep}) do not match potential exit planes ({num_exit_planes}).")
 
-        coherent_intensities_complex = xp.zeros(len(self), dtype=xp.complex64)
-        incoherent_intensities = xp.zeros(len(self), dtype=xp.float32)
+        if coherent:
+            intensities = xp.zeros(len(self), dtype=xp.complex64)
+        else:
+            intensities = xp.zeros(len(self), dtype=xp.float32)
+
+        AA_losses = xp.zeros(len(self), dtype=xp.float32)
 
         propagator = FresnelPropagator()
         antialias_aperture = AntialiasAperture()
-        sigma = energy2sigma(self.energy) #should be moved into BSE_energies loop
+        
+        # TODO: Implement energy loop if BSE_energies is provided
+        sigma = energy2sigma(self.energy) 
 
-        exit_plane_stepsize = potential.exit_planes[1] - potential.exit_planes[0]
-        coherent_prefactor = source.array[1:] * sigma * potential.array[::exit_plane_stepsize] 
-        coherent_prefactor = coherent_prefactor.reshape(num_exit_planes-1, -1)
-
-        incoherent_prefactor = xp.abs(source.array[1:]) ** 2 * (sigma * potential.array[::exit_plane_stepsize]) ** 2 / np.prod(source.array[1:].shape[-2:])
-        incoherent_prefactor = incoherent_prefactor.reshape(num_exit_planes-1, -1)
-
-        exit_plane_lookup = {val: i for i, val in enumerate(potential.exit_planes)}
-
+        # Determine progress bar settings
         if pbar is None:
             pbar = config.get("local_diagnostics.task_level_progress", False)
         pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
-        
+
         for i, _, s_matrix in self.generate_blocks(1):
             s_matrix = s_matrix.item()
             try:
@@ -2340,23 +2492,182 @@ class EBSDReciprocitySMatrix(SMatrix):
                     wave_vectors = xp.asarray(
                         s_matrix.wave_vectors[start:stop], dtype=xp.float32
                     )
-                    waves_norm_total = xp.zeros(wave_vectors.shape[0])
-                    source_norm_total = 0.0
 
+                    # Initialize reciprocity plane waves propagating downwards
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
-                    array *= np.prod(s_matrix.interpolation) / np.prod(array.shape[-2:])
+                    array *= np.prod(s_matrix.interpolation) * np.sqrt(np.prod(array.shape[-2:]))
 
-                    for j, bse_energy in enumerate(BSE_energies):
+                    initial_fft_amplitude = xp.sum(xp.abs(xp.fft.fft2(array, axes=(-2, -1)))**2, axis=(-2, -1))
+
+                    waves = Waves(
+                        array,
+                        energy=s_matrix.energy,
+                        extent=s_matrix.extent,
+                        ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
+                    )
+                    for slice_index in range(num_slices):
+                        # 1. Propagate the reciprocity wave through the current slice
+                        waves = conventional_multislice_step(
+                            waves,
+                            potential[slice_index],
+                            antialias_aperture=antialias_aperture,
+                            propagator=propagator,
+                            order=order,
+                        )
+
+                        # 2. Determine current depth for filtering and source matching
+                        current_depth = (slice_index + 1) * slice_thickness
+
+                        # 3. Apply range limits (if specified)
+                        if range_limit is not None:
+                            if not (range_limit[0] <= current_depth <= range_limit[1]):
+                                continue  # Skip overlap computation, but continue propagating
+                        
+                        # 4. Map the current slice to the corresponding exit plane in `source`
+                        ep_index = slice_index
+            
+                        # 5. Compute the incoherent overlap integral via Reciprocity
+                        if ep_index is not None:
+                            # Intensity of the downward propagating backscatter wave: shape (Batch, N, M)
+                            wave_intensity = xp.abs(waves.array) ** 2
+                            
+                            # Intensity of the incident beam at this depth: shape (N, M)
+                            if coherent:
+                                if multiply_potential:
+                                    # rutherford_screen and alpha remain the same as they are based on intensity/potential scaling
+                                    rutherford_screen = xp.abs(potential.array[ep_index]) ** 2 
+                                    alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2) / xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * rutherford_screen))
+                                    potential_mask = rutherford_screen * alpha**2
+                                    
+                                    # For coherent superposition, apply the amplitude mask (sqrt of intensity mask) 
+                                    # directly to the complex source array
+                                    complex_source = source.array[ep_index+1] * xp.sqrt(potential_mask)
+                                else:
+                                    complex_source = source.array[ep_index+1]
+                                intensities[start:stop] += xp.sum(complex_source * waves.array, axis=(-2, -1))/num_slices
+                            else:
+                                if multiply_potential:
+                                    # sigma = energy2sigma(self.energy)
+                                    potential_mask = xp.abs(potential.array[ep_index]) ** 2 
+
+                                    alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2)/xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * potential_mask))
+                                    potential_mask = potential_mask * alpha**2
+                                    source_intensity = xp.abs(source.array[ep_index+1]) ** 2 * potential_mask
+                                else:
+                                    source_intensity = xp.abs(source.array[ep_index+1]) ** 2
+                                    
+                                # Integrate over real space (summing over axes -2 and -1)
+                                overlap = xp.sum(wave_intensity * source_intensity, axis=(-2, -1))
+                                
+                                intensities[start:stop] += overlap/num_slices
+
+                    pbar.update_if_exists(stop - start)
+                    
+                    # Anti-aliasing aperture sanity check
+                    final_fft_amplitude = xp.sum(xp.abs(xp.fft.fft2(waves.array, axes=(-2, -1)))**2, axis=(-2, -1))
+                    AA_loss = 1 - final_fft_amplitude/initial_fft_amplitude
+                    AA_losses[start:stop] += AA_loss
+                    if xp.max(AA_loss) > 0.05:
+                        lost_percent = 100 * float(xp.max(AA_loss))
+                        warnings.warn(
+                            f"The anti-alias aperture removed {lost_percent:.1f}% total amplitude for at least one wavevector."
+                        )
+            finally:
+                pbar.close_if_exists()
+        if coherent:
+            intensities = xp.abs(intensities)**2
+        return intensities, AA_losses
+
+    def overlap_propagated_exit_waves_grid(
+            self,
+            source,
+            max_batch_size="auto",
+            order: int = 1,
+            pbar: bool = None,
+            multiply_potential: bool = True,
+        ):
+            """
+            Build the plane waves of the scattering matrix and propagate them through the
+            potential using the multislice algorithm to compute EBSD/Kikuchi patterns via reciprocity.
+    
+            Parameters
+            ----------
+            source:
+                The incident beam wavefunction at each slice.
+            max_batch_size:
+                How many wavevectors are computed per batch. Used to save memory.
+            range_limit, optional:
+                Tuple of (min_depth, max_depth). Only slices within this range 
+                contribute to the total backscattered intensity.
+            BSE_energies, optional:
+                Energies to account for in backscatter simulation (inelastic).
+            BSE_energies_weights, optional:
+                Accompanying weights for BSE_energies.
+            Returns
+            -------
+            incoherent_intensities : array
+                The 1D array of EBSD pattern intensities corresponding to the wave vectors.
+            """
+    
+            wave_vector_chunks = self._wave_vector_chunks(max_batch_size)
+            wave_vector_blocks = self._wave_vector_blocks(wave_vector_chunks, lazy=False)
+    
+            potential = self.potential#+ 0.08j * self.potential
+            num_exit_planes = len(potential.exit_planes)
+            num_slices = potential.shape[0]
+
+            # multiple probes can be used if given in shape [z, num_probes ,x,y]
+            if len(source.shape) == 3:
+                num_probes = 1
+                source = source.reshape((source.shape[0], 1, source.shape[1], source.shape[2]))
+            else:
+                num_probes = source.shape[1]
+                
+            xp = get_array_module(self._device)
+    
+            slice_thickness = potential.slice_thickness[0]
+    
+            s_ep, _, s_n, s_m = source.shape
+            if s_ep != num_exit_planes:
+                raise ValueError(f"Source exit planes ({s_ep}) do not match potential exit planes ({num_exit_planes}).")
+    
+            intensities = xp.zeros((num_probes, len(self)), dtype=xp.float32)
+    
+            AA_losses = xp.zeros(len(self), dtype=xp.float32)
+    
+            propagator = FresnelPropagator()
+            antialias_aperture = AntialiasAperture()
+            
+            # TODO: Implement energy loop if BSE_energies is provided
+            sigma = energy2sigma(self.energy) 
+    
+            # Determine progress bar settings
+            if pbar is None:
+                pbar = config.get("local_diagnostics.task_level_progress", False)
+            pbar = TqdmWrapper(total=wave_vector_blocks[-1][-1], enabled=pbar, leave=False)
+    
+            for i, _, s_matrix in self.generate_blocks(1):
+                s_matrix = s_matrix.item()
+                try:
+                    for start, stop in wave_vector_blocks:
+                        wave_vectors = xp.asarray(
+                            s_matrix.wave_vectors[start:stop], dtype=xp.float32
+                        )
+    
+                        # Initialize reciprocity plane waves propagating downwards
+                        array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
+                        array *= np.prod(s_matrix.interpolation) * np.sqrt(np.prod(array.shape[-2:]))
+    
+                        initial_fft_amplitude = xp.sum(xp.abs(xp.fft.fft2(array, axes=(-2, -1)))**2, axis=(-2, -1))
+    
                         waves = Waves(
                             array,
-                            energy=bse_energy,
+                            energy=s_matrix.energy,
                             extent=s_matrix.extent,
                             ensemble_axes_metadata=[OrdinalAxis(values=wave_vectors)],
                         )
-
                         for slice_index in range(num_slices):
-                            if slice_index*slice_thickness > range_limit[1]:
-                                break
+                            # 1. Propagate the reciprocity wave through the current slice
                             waves = conventional_multislice_step(
                                 waves,
                                 potential[slice_index],
@@ -2364,35 +2675,38 @@ class EBSDReciprocitySMatrix(SMatrix):
                                 propagator=propagator,
                                 order=order,
                             )
+    
+                            # 4. Map the current slice to the corresponding exit plane in `source`
+                            ep_index = slice_index
+                
+                            # 5. Compute the incoherent overlap integral via Reciprocity
+                            if ep_index is not None:
+                                # Intensity of the downward propagating backscatter wave: shape (Batch, N, M)
+                                wave_intensity = xp.abs(waves.array) ** 2
+                                
+                                # Intensity of the incident beam at this depth: shape (N, M)
+                                for probe in range(num_probes):
+                                    if multiply_potential:
+                                        source_intensity = xp.abs(source.array[ep_index+1, probe]) ** 2 * potential.array[ep_index] ** 2
+                                    else:
+                                        source_intensity = xp.abs(source.array[ep_index+1, probe]) ** 2
+                                         
+                                    # Integrate over real space (summing over axes -2 and -1)
+                                    overlap = xp.sum(wave_intensity * source_intensity, axis=(-2, -1))
+                                    
+                                    intensities[probe, start:stop] += overlap/num_slices
 
-                            if slice_index in exit_plane_lookup:
-                                if slice_index*slice_thickness >= range_limit[0] and slice_index*slice_thickness <= range_limit[1]:
-                                    exit_plane_index = exit_plane_lookup[slice_index]
-                                    shape = waves.array.shape
-                                    K = shape[0]
-                                    W_flat = waves.array.reshape(K, -1)
-                                    W_flat_conj = W_flat.conj()
-                                    coherent_intensities_complex[start:stop] += (W_flat_conj @ coherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
-
-                                    intensity_flat = xp.abs(W_flat) ** 2
-
-                                    wave_norm_sq = xp.sum((intensity_flat**2), axis=1)
-                                    waves_norm_total += wave_norm_sq * BSE_energies_weights[j]
-                                    source_norm_sq = xp.sum((incoherent_prefactor[exit_plane_index-1]**2))
-                                    source_norm_total += source_norm_sq * BSE_energies_weights[j]
-                                    incoherent_intensities[start:stop] += (intensity_flat @ incoherent_prefactor[exit_plane_index-1]) * BSE_energies_weights[j]
                         pbar.update_if_exists(stop - start)
-                        wave_fft = xp.fft.fft2(waves.array, axes=(-2, -1))
-                        total_amplitude = xp.sum(xp.abs(wave_fft)**2, axis=(-2, -1))
-                        if xp.min(total_amplitude) < 0.95:
-                            lost_percent = 100 * (1 - np.min(total_amplitude))
+                        
+                        # Anti-aliasing aperture sanity check
+                        final_fft_amplitude = xp.sum(xp.abs(xp.fft.fft2(waves.array, axes=(-2, -1)))**2, axis=(-2, -1))
+                        AA_loss = 1 - final_fft_amplitude/initial_fft_amplitude
+                        AA_losses[start:stop] += AA_loss
+                        if xp.max(AA_loss) > 0.05:
+                            lost_percent = 100 * float(xp.max(AA_loss))
                             warnings.warn(
-                                f"The anti-alias aperture removed {lost_percent:.2f}% total amplitude for at least one wavevector"
+                                f"The anti-alias aperture removed {lost_percent:.1f}% total amplitude for at least one wavevector."
                             )
-                        incoherent_intensities[start:stop] /= xp.sqrt(waves_norm_total * source_norm_total)
-            finally:
-                pbar.close_if_exists()
-
-        coherent_intensities = xp.abs(coherent_intensities_complex) ** 2
-
-        return coherent_intensities, incoherent_intensities
+                finally:
+                    pbar.close_if_exists()
+            return intensities, AA_losses
