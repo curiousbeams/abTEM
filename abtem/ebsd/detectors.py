@@ -201,6 +201,33 @@ class BackscatterDetector(CopyMixin, EqualityMixin):
         wavenumber = 1.0 / energy2wavelength(energy)
         return wavenumber * self._directions[:, :2]
 
+    def recommended_sampling(self, energy: float, safety: float = 0.9) -> float:
+        """Real-space sampling that keeps every collected direction resolvable.
+
+        Sized from :attr:`max_scattering_angle`, which for a grid detector is
+        the angle at the *corners* -- larger than `max_angle` by up to a factor
+        ``sqrt(2)``. Sizing the sampling from `max_angle` instead leaves the
+        corners outside the antialias aperture, where they lose essentially all
+        their intensity.
+
+        Parameters
+        ----------
+        energy : float
+            Electron energy [eV].
+        safety : float, optional
+            Fraction of the antialias limit to use (default 0.9).
+
+        Returns
+        -------
+        sampling : float
+            Recommended sampling [Å].
+        """
+        from abtem.ebsd.reference import recommended_sampling
+
+        return recommended_sampling(
+            energy, self.max_scattering_angle * 1e3, safety=safety
+        )
+
     def reciprocal_sampling(self, energy: float) -> float:
         """Reciprocal-space sampling of the detector grid [1 / Å].
 

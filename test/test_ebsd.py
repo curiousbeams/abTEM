@@ -744,3 +744,30 @@ class TestEBSDReferencePattern:
                 probe=abtem.Probe(semiangle_cutoff=10, energy=[30e3, 20e3]),
                 detector=BackscatterDetector(max_angle=50, gpts=4),
             )
+
+
+class TestDetectorRecommendedSampling:
+    def test_sized_from_the_corners_not_the_half_width(self):
+        # A grid's corners sit sqrt(2) further out than max_angle, and sizing
+        # the sampling from max_angle leaves them outside the antialias
+        # aperture, where they lose essentially all their intensity.
+        detector = BackscatterDetector(max_angle=150, gpts=64)
+        assert detector.recommended_sampling(30e3) < recommended_sampling(30e3, 150)
+
+    def test_keeps_every_direction_inside_the_aperture(self):
+        from abtem.core.energy import energy2wavelength
+
+        detector = BackscatterDetector(max_angle=150, gpts=64)
+        sampling = detector.recommended_sampling(30e3)
+
+        k_corner = np.sin(detector.max_scattering_angle) / energy2wavelength(30e3)
+        assert k_corner < 2.0 / 3.0 / (2.0 * sampling)
+
+    def test_a_detector_sized_this_way_barely_clips(self):
+        detector = BackscatterDetector(max_angle=100, gpts=8)
+        patterns = make_ebsd(
+            silicon_slab(),
+            detector,
+            sampling=detector.recommended_sampling(30e3),
+        ).scan()
+        assert patterns.metadata["antialias_loss_max"] < 0.05
