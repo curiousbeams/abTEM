@@ -32,9 +32,21 @@ from abtem.waves import Probe
 
 __all__ = ["EBSDReferencePattern", "patch_half_angle", "recommended_sampling"]
 
-#: Fraction of the antialias-limited sampling used by default. Leaves room for
-#: the scattering that pushes a steeply tilted plane wave past the aperture.
-_SAMPLING_SAFETY = 0.9
+#: Fraction of the antialias-limited sampling used by default.
+#:
+#: A margin is essential rather than cosmetic: a plane wave launched right at
+#: the aperture edge scatters straight past it, and sampling exactly at the
+#: limit (safety = 1.0) loses about 96% of its intensity. Measured on a 40 Å
+#: silicon slab collecting 132 mrad, the loss falls off as
+#:
+#:     safety  1.0     0.9    0.8    0.7    0.6
+#:     loss    95.9%   4.3%   2.4%   1.3%   0.7%
+#:
+#: 0.8 keeps the recommended sampling comfortably below the 5% loss that
+#: :class:`~abtem.ebsd.reciprocity.AntialiasLossWarning` reports, so a
+#: default-configured run does not warn about its own defaults. 0.9 sits right
+#: on that boundary and trips it for some detector geometries.
+_SAMPLING_SAFETY = 0.8
 
 #: Density of the direction grid relative to the output image, so that binning
 #: leaves no empty pixels at the rim where the grid thins out.
@@ -87,7 +99,9 @@ def recommended_sampling(
     max_angle : float
         Largest collected scattering angle [mrad].
     safety : float, optional
-        Fraction of the limit to use (default 0.9).
+        Fraction of the limit to use (default 0.8). Sampling right at the limit
+        loses almost all the intensity of the steepest plane wave, so the
+        margin matters; see ``_SAMPLING_SAFETY``.
 
     Returns
     -------
