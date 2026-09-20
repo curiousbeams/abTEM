@@ -17,9 +17,17 @@ from abtem.ebsd.projections import (
     validate_projection,
 )
 from abtem.ebsd.reciprocity import EBSD
+from abtem.ebsd.reference import (
+    EBSDReferencePattern,
+    patch_half_angle,
+    recommended_sampling,
+)
 
 __all__ = [
     "EBSD",
+    "EBSDReferencePattern",
+    "patch_half_angle",
+    "recommended_sampling",
     "BackscatterDetector",
     "small_angle_error",
     "SphericalPattern",

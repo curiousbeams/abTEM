@@ -54,7 +54,17 @@ from abtem.prism.utils import plane_waves
 from abtem.scan import BaseScan
 from abtem.waves import Probe, Waves
 
-__all__ = ["EBSD"]
+__all__ = ["EBSD", "AntialiasLossWarning"]
+
+
+class AntialiasLossWarning(UserWarning):
+    """The antialias aperture clipped a reciprocity plane wave.
+
+    Raised as its own class so that a caller running many calculations -- a
+    reference pattern, say -- can quiet the individual warnings and report the
+    loss over the whole run instead.
+    """
+
 
 DepthWeight = float | Sequence[float] | np.ndarray | Callable[[np.ndarray], np.ndarray]
 
@@ -308,7 +318,8 @@ class EBSD(CopyMixin, EqualityMixin):
             warnings.warn(
                 f"the antialias aperture removed {max_loss:.1%} of the intensity "
                 f"of at least one reciprocity plane wave; the collected angles "
-                f"are too large for this sampling"
+                f"are too large for this sampling",
+                AntialiasLossWarning,
             )
 
         return self._to_measurement(

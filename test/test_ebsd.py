@@ -19,6 +19,11 @@ from abtem.ebsd import (
     zone_axis_rotation,
 )
 from abtem.ebsd.reciprocity import _validate_depth_weight
+from abtem.ebsd.reference import (
+    EBSDReferencePattern,
+    patch_half_angle,
+    recommended_sampling,
+)
 
 PROJECTIONS = [StereographicProjection(), SquareLambertProjection()]
 PROJECTION_IDS = [p.name for p in PROJECTIONS]
@@ -584,3 +589,147 @@ class TestEBSD:
             patterns.metadata["antialias_loss_mean"]
             <= patterns.metadata["antialias_loss_max"]
         )
+
+
+class TestPatchGeometry:
+    def test_half_angle_shrinks_as_patches_are_added(self):
+        assert patch_half_angle(100) > patch_half_angle(400)
+        # solid angle per patch goes as 1 / n, so the radius goes as 1 / sqrt(n)
+        assert patch_half_angle(100) / patch_half_angle(400) == pytest.approx(2.0)
+
+    def test_half_angle_covers_the_hemisphere(self):
+        # The discs must at least cover the hemisphere: n * (1 - cos(a)) >= 1,
+        # since a cap of half-angle a subtends 2*pi*(1 - cos a) of the 2*pi.
+        for n_patches in (50, 200, 400, 1000):
+            half_angle = patch_half_angle(n_patches) * 1e-3
+            assert n_patches * (1.0 - np.cos(half_angle)) > 1.0
+
+    def test_half_angle_rejects_non_positive(self):
+        with pytest.raises(ValueError, match="n_patches must be at least 1"):
+            patch_half_angle(0)
+
+    @pytest.mark.parametrize("max_angle", [50.0, 132.0, 300.0])
+    def test_recommended_sampling_stays_inside_the_aperture(self, max_angle):
+        from abtem.core.energy import energy2wavelength
+
+        sampling = recommended_sampling(30e3, max_angle)
+        k_collected = np.sin(max_angle * 1e-3) / energy2wavelength(30e3)
+        k_aperture = 2.0 / 3.0 / (2.0 * sampling)
+        assert k_collected < k_aperture
+
+
+class TestEBSDReferencePattern:
+    @pytest.fixture
+    def builder(self):
+        return EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=1,
+            slab_cell=(6.0, 6.0, 4.0),
+            gpts=8,
+            direction_gpts=30,
+            max_angle=200.0,
+        )
+
+    def test_defaults_are_derived_from_the_patch_count(self):
+        builder = EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=400,
+            gpts=128,
+        )
+        assert builder.max_angle == pytest.approx(patch_half_angle(400))
+        assert builder.sampling == pytest.approx(
+            recommended_sampling(30e3, patch_half_angle(400))
+        )
+        assert len(builder.zone_axes) == 400
+
+    def test_warns_about_too_coarse_a_sampling(self):
+        with pytest.warns(UserWarning, match="cannot resolve"):
+            EBSDReferencePattern(
+                ase.build.bulk("Si", "diamond", a=5.431),
+                probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+                n_patches=400,
+                sampling=1.0,
+            )
+
+    def test_every_direction_is_assigned_exactly_once(self):
+        builder = EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=40,
+            gpts=16,
+        )
+        assignment = builder._assign_directions()
+        counts = np.bincount(
+            np.concatenate(assignment), minlength=len(builder.directions)
+        )
+        assert np.all(counts == 1)
+
+    def test_overlap_tolerance_shares_directions_between_patches(self):
+        common = dict(
+            atoms=ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=40,
+            gpts=16,
+        )
+        without = EBSDReferencePattern(**common)
+        with_overlap = EBSDReferencePattern(**common, overlap_tolerance=0.1)
+
+        assert sum(map(len, with_overlap._assign_directions())) > sum(
+            map(len, without._assign_directions())
+        )
+
+    def test_assignment_covers_the_whole_direction_grid(self):
+        builder = EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=40,
+            gpts=16,
+        )
+        assigned = np.unique(np.concatenate(builder._assign_directions()))
+        assert len(assigned) == len(builder.directions)
+
+    def test_compute_returns_directions_within_the_patch(self, builder):
+        pattern = builder.compute(pbar=False)
+        assert isinstance(pattern, SphericalPattern)
+        assert 0 < len(pattern) <= len(builder.directions)
+
+        zone_axis = builder.zone_axes[0]
+        cosines = pattern.directions @ zone_axis
+        assert np.all(cosines > np.cos(builder.max_angle * 1e-3))
+
+    def test_compute_matches_a_direct_calculation(self, builder):
+        # The builder is bookkeeping around EBSD.scan; running the one patch by
+        # hand must give the same numbers.
+        pattern = builder.compute(pbar=False)
+
+        slab, rotation = rotated_slab(
+            builder._atoms, builder.zone_axes[0], builder._slab_cell
+        )
+        direct = EBSD(
+            abtem.Potential(
+                slab,
+                sampling=builder.sampling,
+                slice_thickness=1.0,
+                projection="finite",
+            ),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            detector=BackscatterDetector(
+                directions=pattern.directions @ rotation.T
+            ),
+        ).scan()
+
+        assert np.allclose(pattern.array, direct.array, rtol=1e-6)
+
+    def test_compute_records_the_setup_in_the_metadata(self, builder):
+        metadata = builder.compute(pbar=False).metadata
+        assert metadata["n_patches"] == 1
+        assert metadata["max_angle"] == pytest.approx(200.0)
+        assert metadata["energy"] == 30e3
+        assert metadata["projection"] == "stereographic"
+
+    def test_compute_projects_to_an_image(self, builder):
+        images = builder.compute(pbar=False).project(8)
+        assert images.array.shape == (8, 8)
+        assert np.all(np.isfinite(images.array))
