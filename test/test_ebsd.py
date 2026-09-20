@@ -2,16 +2,23 @@ import ase
 import numpy as np
 import pytest
 
+import abtem
+from abtem.core.axes import OrdinalAxis
 from abtem.ebsd import (
+    EBSD,
+    BackscatterDetector,
+    SphericalPattern,
     SquareLambertProjection,
     StereographicProjection,
     bin_directions,
+    bulk_block,
     estimate_repetitions,
     fibonacci_hemisphere,
     rotated_slab,
     validate_projection,
     zone_axis_rotation,
 )
+from abtem.ebsd.reciprocity import _validate_depth_weight
 
 PROJECTIONS = [StereographicProjection(), SquareLambertProjection()]
 PROJECTION_IDS = [p.name for p in PROJECTIONS]
@@ -208,3 +215,372 @@ class TestRotatedSlab:
     def test_rejects_wrong_cell_shape(self, silicon):
         with pytest.raises(ValueError, match=r"shape \(3,\)"):
             rotated_slab(silicon, np.array([0.0, 0.0, 1.0]), (10.0, 10.0))
+
+    def test_a_reused_block_gives_the_same_slab(self, silicon):
+        # Building the block is the expensive part, so a reference pattern
+        # builds it once and cuts every zone axis out of it. That must give
+        # exactly what repeating per call does.
+        cell = (10.0, 10.0, 20.0)
+        zone_axis = np.array([1.0, 2.0, 3.0])
+
+        block = bulk_block(silicon, cell, (12, 12, 12))
+        reused, _ = rotated_slab(block, zone_axis, cell, repetitions=(1, 1, 1))
+        rebuilt, _ = rotated_slab(silicon, zone_axis, cell, repetitions=(12, 12, 12))
+
+        assert np.array_equal(reused.positions, rebuilt.positions)
+        assert np.array_equal(reused.numbers, rebuilt.numbers)
+
+    def test_a_reused_block_is_not_mutated(self, silicon):
+        # rotated_slab rotates and recentres in place, so it has to copy.
+        cell = (10.0, 10.0, 20.0)
+        block = bulk_block(silicon, cell, (12, 12, 12))
+        before = block.positions.copy()
+
+        rotated_slab(block, np.array([1.0, 1.0, 1.0]), cell, repetitions=(1, 1, 1))
+
+        assert np.array_equal(block.positions, before)
+
+    def test_bulk_block_defaults_to_the_estimated_repetitions(self, silicon):
+        cell = (10.0, 10.0, 20.0)
+        block = bulk_block(silicon, cell)
+        expected = silicon * estimate_repetitions(silicon, cell)
+        assert len(block) == len(expected)
+
+
+class TestBackscatterDetector:
+    def test_grid_directions_are_unit_vectors_into_the_crystal(self):
+        detector = BackscatterDetector(max_angle=200, gpts=9)
+        assert detector.directions.shape == (81, 3)
+        assert np.allclose(np.linalg.norm(detector.directions, axis=1), 1.0)
+        assert np.all(detector.directions[:, 2] > 0.0)
+
+    def test_grid_is_centred_on_the_beam_direction(self):
+        detector = BackscatterDetector(max_angle=200, gpts=9)
+        centre = detector.directions.reshape(9, 9, 3)[9 // 2, 9 // 2]
+        assert np.allclose(centre, [0.0, 0.0, 1.0])
+
+    def test_grid_half_width_matches_max_angle(self):
+        detector = BackscatterDetector(max_angle=200, gpts=64)
+        transverse = np.abs(detector.directions[:, :2]).max()
+        assert transverse == pytest.approx(np.sin(0.2), rel=0.05)
+
+    def test_base_shape(self):
+        assert BackscatterDetector(max_angle=100, gpts=7).base_shape == (7, 7)
+        directions = random_hemisphere_directions(5)
+        assert BackscatterDetector(directions=directions).base_shape == (5,)
+
+    def test_explicit_directions_are_normalized(self):
+        detector = BackscatterDetector(directions=np.array([[0.0, 0.0, 2.0]]))
+        assert np.allclose(detector.directions, [[0.0, 0.0, 1.0]])
+
+    def test_transverse_wave_vectors_scale_with_the_wave_number(self):
+        from abtem.core.energy import energy2wavelength
+
+        detector = BackscatterDetector(max_angle=100, gpts=5)
+        for energy in (30e3, 200e3):
+            expected = detector.directions[:, :2] / energy2wavelength(energy)
+            assert np.allclose(detector.transverse_wave_vectors(energy), expected)
+
+    def test_reciprocal_sampling_spans_the_grid(self):
+        detector = BackscatterDetector(max_angle=100, gpts=16)
+        vectors = detector.transverse_wave_vectors(30e3)
+        step = np.diff(np.unique(np.round(vectors[:, 0], 9)))
+        assert np.allclose(step, detector.reciprocal_sampling(30e3))
+
+    def test_reciprocal_sampling_rejects_explicit_directions(self):
+        detector = BackscatterDetector(directions=random_hemisphere_directions(4))
+        with pytest.raises(RuntimeError, match="no regular sampling"):
+            detector.reciprocal_sampling(30e3)
+
+    def test_is_grid(self):
+        assert BackscatterDetector(max_angle=100, gpts=4).is_grid
+        assert not BackscatterDetector(
+            directions=random_hemisphere_directions(4)
+        ).is_grid
+
+    def test_warns_when_the_small_angle_approximation_fails(self):
+        with pytest.warns(UserWarning, match="small-angle approximation"):
+            BackscatterDetector(max_angle=700, gpts=5)
+
+    def test_rejects_backward_directions(self):
+        with pytest.raises(ValueError, match="positive z component"):
+            BackscatterDetector(directions=np.array([[0.0, 0.0, -1.0]]))
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({}, "give either"),
+            ({"max_angle": 100}, "must be given together"),
+            ({"gpts": 4}, "must be given together"),
+            (
+                {"max_angle": 100, "gpts": 4, "directions": np.zeros((1, 3))},
+                "not both",
+            ),
+            ({"directions": np.zeros((3, 2))}, r"shape \(N, 3\)"),
+        ],
+    )
+    def test_rejects_bad_arguments(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            BackscatterDetector(**kwargs)
+
+
+class TestSphericalPattern:
+    @pytest.fixture
+    def pattern(self):
+        directions = fibonacci_hemisphere(500)
+        return SphericalPattern(
+            1.0 + directions[:, 2], directions, metadata={"energy": 30e3}
+        )
+
+    def test_project_shape_and_axes(self, pattern):
+        images = pattern.project(32)
+        assert images.array.shape == (32, 32)
+        assert [axis.units for axis in images.base_axes_metadata] == ["", ""]
+        assert images.metadata["projection"] == "stereographic"
+
+    def test_project_preserves_the_ensemble(self):
+        directions = fibonacci_hemisphere(200)
+        array = np.stack([np.ones(200), 2 * np.ones(200)])
+        pattern = SphericalPattern(
+            array, directions, ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))]
+        )
+        images = pattern.project(16)
+        assert images.array.shape == (2, 16, 16)
+        assert images.array[1].max() == pytest.approx(2.0)
+
+    def test_zarr_round_trip(self, pattern, tmp_path):
+        url = str(tmp_path / "pattern.zarr")
+        pattern.to_zarr(url)
+        restored = SphericalPattern.from_zarr(url)
+        assert np.array_equal(restored.array, pattern.array)
+        assert np.array_equal(restored.directions, pattern.directions)
+        assert restored.metadata == pattern.metadata
+
+    def test_concatenate(self, pattern):
+        halves = [
+            SphericalPattern(pattern.array[:200], pattern.directions[:200]),
+            SphericalPattern(pattern.array[200:], pattern.directions[200:]),
+        ]
+        joined = SphericalPattern.concatenate(halves)
+        assert np.array_equal(joined.array, pattern.array)
+        assert np.array_equal(joined.directions, pattern.directions)
+
+    def test_concatenate_rejects_mismatched_ensembles(self, pattern):
+        other = SphericalPattern(
+            np.stack([pattern.array, pattern.array]),
+            pattern.directions,
+            ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))],
+        )
+        with pytest.raises(ValueError, match="mismatched ensemble shapes"):
+            SphericalPattern.concatenate([pattern, other])
+
+    def test_concatenate_rejects_empty(self):
+        with pytest.raises(ValueError, match="empty sequence"):
+            SphericalPattern.concatenate([])
+
+    def test_rejects_mismatched_array_and_directions(self):
+        with pytest.raises(ValueError, match="last axis of array"):
+            SphericalPattern(np.zeros(4), fibonacci_hemisphere(5))
+
+    def test_rejects_wrong_ensemble_axis_count(self):
+        with pytest.raises(ValueError, match="ensemble axes"):
+            SphericalPattern(np.zeros((2, 5)), fibonacci_hemisphere(5))
+
+
+def silicon_slab(thickness=8.0, zone_axis=(0.0, 0.0, 1.0)):
+    return rotated_slab(
+        ase.build.bulk("Si", "diamond", a=5.431),
+        np.array(zone_axis),
+        (10.0, 10.0, thickness),
+    )[0]
+
+
+def make_ebsd(atoms, detector, sampling=0.15, **kwargs):
+    return EBSD(
+        abtem.Potential(
+            atoms, sampling=sampling, slice_thickness=1.0, projection="finite"
+        ),
+        probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+        detector=detector,
+        **kwargs,
+    )
+
+
+class TestDepthWeight:
+    @pytest.mark.parametrize(
+        "weight, expected",
+        [
+            (None, [0.25] * 4),
+            (np.ones(4), [0.25] * 4),
+            ([1.0, 1.0, 0.0, 0.0], [0.5, 0.5, 0.0, 0.0]),
+        ],
+    )
+    def test_normalized_to_sum_to_one(self, weight, expected):
+        depths = np.arange(1.0, 5.0)
+        assert np.allclose(_validate_depth_weight(weight, depths), expected)
+
+    def test_escape_depth_decays_exponentially(self):
+        depths = np.arange(1.0, 5.0)
+        weights = _validate_depth_weight(2.0, depths)
+        ratios = weights[1:] / weights[:-1]
+        assert np.allclose(ratios, np.exp(-0.5))
+
+    def test_callable(self):
+        depths = np.arange(1.0, 5.0)
+        weights = _validate_depth_weight(lambda z: np.ones_like(z), depths)
+        assert np.allclose(weights, 0.25)
+
+    @pytest.mark.parametrize(
+        "weight, match",
+        [
+            (-1.0, "escape depth must be positive"),
+            (np.ones(3), "one weight per slice"),
+            (np.array([-1.0, 1.0, 1.0, 1.0]), "must not be negative"),
+            (np.zeros(4), "must not be all zero"),
+        ],
+    )
+    def test_rejects_bad_weights(self, weight, match):
+        with pytest.raises(ValueError, match=match):
+            _validate_depth_weight(weight, np.arange(1.0, 5.0))
+
+
+class TestEBSD:
+    def test_vacuum_gives_unit_yield(self):
+        # With no specimen the reciprocity plane waves stay plane waves, so the
+        # overlap with the beam is the beam's own intensity and the yield is 1
+        # by construction of the normalization.
+        vacuum = ase.Atoms(cell=(10.0, 10.0, 8.0), pbc=True)
+        patterns = make_ebsd(
+            vacuum,
+            BackscatterDetector(max_angle=50, gpts=5),
+            sampling=0.1,
+            potential_weighting=False,
+        ).scan()
+        assert np.allclose(patterns.array, 1.0, atol=5e-3)
+
+    def test_vacuum_with_potential_weighting_generates_nothing(self):
+        # Every slice is empty, so there is nothing to scatter off. This must
+        # come out as zero rather than 0/0.
+        vacuum = ase.Atoms(cell=(10.0, 10.0, 8.0), pbc=True)
+        patterns = make_ebsd(
+            vacuum,
+            BackscatterDetector(max_angle=50, gpts=5),
+            sampling=0.1,
+            potential_weighting=True,
+        ).scan()
+        assert np.all(np.isfinite(patterns.array))
+        assert np.allclose(patterns.array, 0.0)
+
+    def test_uniform_depth_weight_matches_the_default(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        default = make_ebsd(atoms, detector).scan()
+        explicit = make_ebsd(
+            atoms, detector, depth_weight=np.ones(int(atoms.cell[2, 2]))
+        ).scan()
+        assert np.allclose(default.array, explicit.array)
+
+    def test_a_long_escape_depth_approaches_uniform_weighting(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        uniform = make_ebsd(atoms, detector).scan()
+        deep = make_ebsd(atoms, detector, depth_weight=1e6).scan()
+        assert np.allclose(uniform.array, deep.array, rtol=1e-4)
+
+    def test_a_short_escape_depth_weights_the_surface(self):
+        # A shallow escape depth must give a different answer from a uniform
+        # one; otherwise the weighting is not reaching the accumulation.
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        uniform = make_ebsd(atoms, detector).scan()
+        shallow = make_ebsd(atoms, detector, depth_weight=2.0).scan()
+        assert not np.allclose(uniform.array, shallow.array, rtol=1e-3)
+
+    def test_batching_does_not_change_the_result(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=6)
+        whole = make_ebsd(atoms, detector).scan(max_batch_directions=10_000)
+        split = make_ebsd(atoms, detector).scan(max_batch_directions=4)
+        assert np.allclose(whole.array, split.array, rtol=1e-5)
+
+    def test_grid_detector_returns_diffraction_patterns(self):
+        patterns = make_ebsd(
+            silicon_slab(), BackscatterDetector(max_angle=50, gpts=8)
+        ).scan()
+        assert isinstance(patterns, abtem.DiffractionPatterns)
+        assert patterns.array.shape == (8, 8)
+        assert patterns.metadata["energy"] == 30e3
+        assert "antialias_loss_max" in patterns.metadata
+
+    def test_explicit_directions_reproduce_the_equivalent_grid(self):
+        # The two ways of building a detector describe the same directions, so
+        # they must give the same intensities -- only the measurement type and
+        # its shape differ.
+        atoms = silicon_slab()
+        grid = BackscatterDetector(max_angle=50, gpts=4)
+        explicit = BackscatterDetector(directions=grid.directions)
+
+        from_grid = make_ebsd(atoms, grid).scan()
+        from_explicit = make_ebsd(atoms, explicit).scan()
+
+        assert isinstance(from_explicit, SphericalPattern)
+        assert from_explicit.array.shape == (16,)
+        assert np.allclose(from_explicit.directions, grid.directions)
+        assert np.allclose(from_grid.array.ravel(), from_explicit.array, rtol=1e-6)
+
+    def test_scan_adds_a_leading_ensemble_axis(self):
+        scan = abtem.CustomScan([[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]])
+        patterns = make_ebsd(
+            silicon_slab(), BackscatterDetector(max_angle=50, gpts=4)
+        ).scan(scan=scan)
+        assert patterns.array.shape == (3, 4, 4)
+        assert len(patterns.ensemble_axes_metadata) == 1
+
+    def test_each_scan_position_matches_its_own_calculation(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        positions = [[2.0, 2.0], [7.0, 3.0]]
+
+        together = make_ebsd(atoms, detector).scan(
+            scan=abtem.CustomScan(positions)
+        )
+        for i, position in enumerate(positions):
+            alone = make_ebsd(atoms, detector).scan(
+                scan=abtem.CustomScan([position])
+            )
+            assert np.allclose(together.array[i], alone.array[0], rtol=1e-5)
+
+    def test_yield_is_of_order_one(self):
+        # The normalization is relative to a featureless specimen, so a real
+        # one should land near unity rather than at an arbitrary scale.
+        patterns = make_ebsd(
+            silicon_slab(), BackscatterDetector(max_angle=50, gpts=8)
+        ).scan()
+        assert 0.5 < patterns.array.mean() < 2.0
+
+    def test_lazy_is_refused(self):
+        with pytest.raises(NotImplementedError, match="lazy=False"):
+            make_ebsd(
+                silicon_slab(), BackscatterDetector(max_angle=50, gpts=4)
+            ).scan(lazy=True)
+
+    def test_warns_when_the_antialias_aperture_clips(self):
+        # A plane wave launched near the aperture edge scatters straight past
+        # it, so collecting wide angles on a coarse grid silently loses
+        # intensity. The calculation measures that loss and says so.
+        with pytest.warns(UserWarning, match="antialias aperture removed"):
+            make_ebsd(
+                silicon_slab(),
+                BackscatterDetector(max_angle=150, gpts=4),
+                sampling=0.2,
+            ).scan()
+
+    def test_antialias_loss_is_reported_in_the_metadata(self):
+        patterns = make_ebsd(
+            silicon_slab(), BackscatterDetector(max_angle=50, gpts=4)
+        ).scan()
+        assert 0.0 <= patterns.metadata["antialias_loss_mean"] < 0.05
+        assert (
+            patterns.metadata["antialias_loss_mean"]
+            <= patterns.metadata["antialias_loss_max"]
+        )

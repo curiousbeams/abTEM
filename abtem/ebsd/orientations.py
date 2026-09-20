@@ -28,6 +28,7 @@ __all__ = [
     "fibonacci_hemisphere",
     "zone_axis_rotation",
     "estimate_repetitions",
+    "bulk_block",
     "rotated_slab",
 ]
 
@@ -157,6 +158,39 @@ def estimate_repetitions(
     return tuple(int(np.ceil(diagonal / length)) for length in lengths)  # type: ignore[return-value]
 
 
+def bulk_block(
+    atoms: Atoms,
+    cell: tuple[float, float, float],
+    repetitions: tuple[int, int, int] | None = None,
+) -> Atoms:
+    """The repeated block that :func:`rotated_slab` cuts a slab out of.
+
+    Building the block is the expensive part of cutting a slab, and it does not
+    depend on the zone axis, so a reference pattern covering many zone axes
+    should build it once here and pass it to :func:`rotated_slab` with
+    ``repetitions=(1, 1, 1)``.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The unit cell of the crystal.
+    cell : tuple of three float
+        Dimensions of the slab to be cut [Å].
+    repetitions : tuple of three int, optional
+        Repetitions of `atoms`. If not given, :func:`estimate_repetitions`
+        chooses the smallest block that can contain the slab at any
+        orientation.
+
+    Returns
+    -------
+    block : ase.Atoms
+    """
+    if repetitions is None:
+        repetitions = estimate_repetitions(atoms, cell)
+
+    return atoms * repetitions
+
+
 def rotated_slab(
     atoms: Atoms,
     zone_axis: np.ndarray,
@@ -184,7 +218,10 @@ def rotated_slab(
     repetitions : tuple of three int, optional
         Repetitions of `atoms` used to build the block that the slab is cut
         from. If not given, :func:`estimate_repetitions` chooses the smallest
-        block that can contain the slab at any orientation.
+        block that can contain the slab at any orientation. Pass
+        ``(1, 1, 1)`` when `atoms` is already a block built by
+        :func:`bulk_block`, which is how to avoid rebuilding it for every zone
+        axis.
 
         The slab is cut around the *centre* of the block, so the repetitions
         also fix which point of the crystal ends up at the centre of the slab.
@@ -204,13 +241,17 @@ def rotated_slab(
     if cell_array.shape != (3,):
         raise ValueError(f"cell must have shape (3,), got {cell_array.shape}")
 
-    if repetitions is None:
-        repetitions = estimate_repetitions(atoms, cell)
-
     zone_axis = np.asarray(zone_axis, dtype=float).ravel()
     rotation = zone_axis_rotation(zone_axis)
 
-    block = atoms * repetitions
+    if repetitions == (1, 1, 1):
+        # `atoms` is already the block; copy it because the rotation and the
+        # recentring below are in place, and a caller reusing one block across
+        # many zone axes must not see it mutated.
+        block = atoms.copy()
+    else:
+        block = bulk_block(atoms, cell, repetitions)
+
     # ASE's own rotation is used rather than `rotation` so that the cut is
     # reproducible against code that calls Atoms.rotate directly; the two agree
     # to floating-point precision (see test_zone_axis_rotation_matches_ase).
