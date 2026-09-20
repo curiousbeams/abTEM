@@ -45,6 +45,7 @@ from abtem.core.backend import get_array_module, validate_device
 from abtem.core.chunks import chunk_ranges, validate_chunks
 from abtem.core.diagnostics import TqdmWrapper
 from abtem.core.utils import CopyMixin, EqualityMixin, get_dtype
+from abtem.distributions import BaseDistribution
 from abtem.ebsd.detectors import BackscatterDetector
 from abtem.ebsd.measurements import SphericalPattern
 from abtem.measurements import DiffractionPatterns
@@ -171,6 +172,17 @@ class EBSD(CopyMixin, EqualityMixin):
         order: Literal[1, 2, "exact"] = "exact",
         device: Optional[str] = None,
     ):
+        if isinstance(probe.energy, BaseDistribution):
+            # The reciprocity waves would have to propagate at the backscattered
+            # energy while the beam stays at its own, so the two wavefields could
+            # no longer share a transmission function. Refuse it plainly rather
+            # than letting _valid_energy raise "Energy is not defined".
+            raise NotImplementedError(
+                "EBSD does not support an energy ensemble; give the probe a "
+                "single energy and combine the results yourself if you need a "
+                "spread of backscattered energies"
+            )
+
         self._potential = validate_potential(potential)
         self._probe = probe
         self._detector = detector

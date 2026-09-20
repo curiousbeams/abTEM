@@ -15,6 +15,7 @@ from abtem.detectors import (
     SpectralSlitDetector,
     WavesDetector,
 )
+from abtem.ebsd import EBSD, BackscatterDetector, EBSDReferencePattern
 from abtem.inelastic.phonons import (
     AtomsEnsemble,
     EnergyResolvedAtomsEnsemble,
@@ -97,4 +98,7 @@ __all__ = [
     "transfer",
     "BlochWaves",
     "StructureFactor",
+    "EBSD",
+    "EBSDReferencePattern",
+    "BackscatterDetector",
 ]

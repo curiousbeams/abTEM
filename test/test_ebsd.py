@@ -705,7 +705,7 @@ class TestEBSDReferencePattern:
         pattern = builder.compute(pbar=False)
 
         slab, rotation = rotated_slab(
-            builder._atoms, builder.zone_axes[0], builder._slab_cell
+            builder.atoms, builder.zone_axes[0], builder.slab_cell
         )
         direct = EBSD(
             abtem.Potential(
@@ -733,3 +733,14 @@ class TestEBSDReferencePattern:
         images = builder.compute(pbar=False).project(8)
         assert images.array.shape == (8, 8)
         assert np.all(np.isfinite(images.array))
+
+    def test_energy_ensemble_is_refused(self):
+        # The reciprocity waves would have to propagate at the backscattered
+        # energy while the beam stays at its own; say so rather than failing
+        # deep inside with "Energy is not defined".
+        with pytest.raises(NotImplementedError, match="energy ensemble"):
+            EBSD(
+                silicon_slab(),
+                probe=abtem.Probe(semiangle_cutoff=10, energy=[30e3, 20e3]),
+                detector=BackscatterDetector(max_angle=50, gpts=4),
+            )

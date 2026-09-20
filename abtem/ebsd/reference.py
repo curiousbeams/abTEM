@@ -211,6 +211,36 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         )
 
     @property
+    def atoms(self) -> Atoms:
+        """The unit cell of the crystal."""
+        return self._atoms
+
+    @property
+    def probe(self) -> Probe:
+        """The incident beam."""
+        return self._probe
+
+    @property
+    def slab_cell(self) -> tuple[float, float, float]:
+        """Dimensions of the slab cut for each patch [Å]."""
+        return self._slab_cell
+
+    @property
+    def n_patches(self) -> int:
+        """Number of zone-axis patches tiling the hemisphere."""
+        return self._n_patches
+
+    @property
+    def gpts(self) -> int:
+        """Pixels per axis of the projected image."""
+        return self._gpts
+
+    @property
+    def projection(self) -> HemisphereProjection:
+        """Projection the sampled directions are drawn from."""
+        return self._projection
+
+    @property
     def zone_axes(self) -> np.ndarray:
         """The zone axis of each patch, as unit vectors of shape ``(M, 3)``."""
         return fibonacci_hemisphere(self._n_patches)
@@ -337,7 +367,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         pattern = SphericalPattern.concatenate(patterns)
         pattern.metadata.update(
             {
-                "energy": self._probe._valid_energy,
+                "energy": self._probe.energy,
                 "label": "backscattered intensity",
                 "n_patches": self._n_patches,
                 "max_angle": self._max_angle,
