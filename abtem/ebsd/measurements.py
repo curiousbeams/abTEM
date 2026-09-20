@@ -132,12 +132,95 @@ class SphericalPattern(CopyMixin, EqualityMixin):
     def __len__(self) -> int:
         return len(self._directions)
 
+    def interpolate(
+        self,
+        gpts: int,
+        projection: str | HemisphereProjection = "lambert",
+    ) -> ReferencePatternImages:
+        """Sample the intensities at the nodes of a square grid.
+
+        This differs from :meth:`project`, which *bins* the directions into
+        pixels and therefore needs more directions than pixels to avoid holes.
+        Here the value is evaluated *at* each grid node by interpolating the
+        sampled directions, so any grid size is well defined.
+
+        Node sampling is what a master pattern file wants, because a consumer
+        reading it interpolates between nodes. When the pattern was calculated
+        on the very grid requested -- build it with the matching `projection`
+        and ``direction_gpts=gpts`` -- the interpolation is exact and this is a
+        lossless repackaging.
+
+        Parameters
+        ----------
+        gpts : int
+            Number of grid nodes along each axis, spanning ``[-1, 1]``.
+        projection : str or HemisphereProjection, optional
+            One of ``'lambert'`` (default, the master-pattern convention) or
+            ``'stereographic'``.
+
+        Returns
+        -------
+        images : ReferencePatternImages
+            Nodes outside the projection's domain -- the corners the
+            stereographic disk does not cover -- are zero.
+        """
+        from scipy.interpolate import griddata  # type: ignore[import-untyped]
+
+        projection = validate_projection(projection)
+
+        northern = self._directions[:, 2] >= 0.0
+        source = projection.project(self._directions[northern])
+
+        nodes = np.linspace(-1.0, 1.0, gpts)
+        x, y = np.meshgrid(nodes, nodes, indexing="ij")
+        target = np.stack([x.ravel(), y.ravel()], axis=1)
+        inside = projection.domain_mask(target)
+
+        flat = self._array.reshape(-1, len(self._directions))[:, northern]
+
+        images = np.zeros((len(flat), gpts * gpts))
+        fraction_filled = 0.0
+        for i, values in enumerate(flat):
+            interpolated = griddata(source, values, target[inside], method="linear")
+            # Nodes beyond the convex hull of the sampled directions come back
+            # as NaN; fall back to the nearest sample rather than a hole.
+            missing = np.isnan(interpolated)
+            if missing.any():
+                fraction_filled = max(fraction_filled, float(missing.mean()))
+                interpolated[missing] = griddata(
+                    source, values, target[inside][missing], method="nearest"
+                )
+            images[i, inside] = interpolated
+
+        if fraction_filled > 0.001:
+            warnings.warn(
+                f"{fraction_filled:.1%} of the nodes lie outside the sampled "
+                f"directions and were filled from the nearest one, which shows "
+                f"up as flat patches near the edges. Sample the pattern in the "
+                f"{projection.name} projection to cover the grid exactly.",
+                SparseProjectionWarning,
+            )
+
+        images = images.reshape(self.ensemble_shape + (gpts, gpts))
+
+        return ReferencePatternImages(
+            images,
+            sampling=2.0 / (gpts - 1),
+            ensemble_axes_metadata=self.ensemble_axes_metadata,
+            metadata={**self._metadata, "projection": projection.name},
+        )
+
     def project(
         self,
         gpts: int,
         projection: str | HemisphereProjection = "stereographic",
     ) -> ReferencePatternImages:
         """Bin the intensities into a square image.
+
+        Each pixel is the mean of the directions falling inside it, so the
+        directions have to outnumber the pixels or the image has holes. Use
+        :meth:`interpolate` to evaluate at grid nodes instead, which is what a
+        master pattern file needs.
 
         Parameters
         ----------

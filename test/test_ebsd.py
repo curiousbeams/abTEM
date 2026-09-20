@@ -20,6 +20,7 @@ from abtem.ebsd import (
     pixel_centers,
     rotated_slab,
     validate_projection,
+    write_emsoft_master_pattern,
     zone_axis_rotation,
 )
 from abtem.ebsd.reciprocity import _validate_depth_weight
@@ -848,3 +849,152 @@ class TestPixelCenters:
         )
         assert counts.sum() == 1
         assert image[counts > 0] == pytest.approx(7.0)
+
+
+class TestInterpolate:
+    def test_exact_when_sampled_on_the_same_grid(self):
+        # Sampling the pattern on the grid it is asked for makes the
+        # interpolation a repackaging: the node values are the computed ones.
+        gpts = 61
+        directions = SquareLambertProjection().grid(gpts)
+        values = 1.0 + directions[:, 2] + 0.3 * directions[:, 0]
+        pattern = SphericalPattern(values, directions)
+
+        image = np.asarray(pattern.interpolate(gpts, "lambert").array)
+
+        nodes = np.linspace(-1, 1, gpts)
+        x, y = np.meshgrid(nodes, nodes, indexing="ij")
+        expected = SquareLambertProjection().unproject(
+            np.stack([x.ravel(), y.ravel()], axis=1)
+        )
+        expected = 1.0 + expected[:, 2] + 0.3 * expected[:, 0]
+        assert np.allclose(image.ravel(), expected, atol=1e-10)
+
+    def test_no_nearest_fill_when_sampled_in_the_same_projection(self):
+        directions = SquareLambertProjection().grid(101)
+        pattern = SphericalPattern(1.0 + directions[:, 2], directions)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SparseProjectionWarning)
+            pattern.interpolate(51, "lambert")
+
+    def test_warns_when_the_grid_reaches_past_the_sampled_directions(self):
+        # A stereographic sampling does not reach the corners of the Lambert
+        # square, so those nodes have to be filled from the nearest sample.
+        directions = StereographicProjection().grid(101)
+        pattern = SphericalPattern(1.0 + directions[:, 2], directions)
+        with pytest.warns(SparseProjectionWarning, match="outside the sampled"):
+            pattern.interpolate(51, "lambert")
+
+    def test_stereographic_corners_are_zero(self):
+        directions = StereographicProjection().grid(101)
+        pattern = SphericalPattern(1.0 + directions[:, 2], directions)
+        image = np.asarray(pattern.interpolate(51, "stereographic").array)
+        assert image[0, 0] == 0.0
+        assert image[25, 25] > 0.0
+
+    def test_preserves_the_ensemble(self):
+        directions = SquareLambertProjection().grid(41)
+        array = np.stack([np.ones(len(directions)), 2 * np.ones(len(directions))])
+        pattern = SphericalPattern(
+            array, directions, ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))]
+        )
+        image = pattern.interpolate(21, "lambert")
+        assert image.array.shape == (2, 21, 21)
+        assert np.allclose(image.array[1], 2.0)
+
+
+class TestEMsoftWriter:
+    @pytest.fixture
+    def silicon(self):
+        return ase.build.bulk("Si", "diamond", a=5.431)
+
+    @pytest.fixture
+    def pattern(self):
+        directions = SquareLambertProjection().grid(81)
+        values = 1.0 + 0.5 * directions[:, 2] ** 2
+        return SphericalPattern(values, directions, metadata={"energy": 30e3})
+
+    @pytest.fixture
+    def written(self, tmp_path, pattern, silicon):
+        h5py = pytest.importorskip("h5py")
+        pytest.importorskip("spglib")
+        path = str(tmp_path / "master.h5")
+        write_emsoft_master_pattern(path, pattern, silicon, npx=20)
+        return path, h5py
+
+    def test_array_shapes_follow_the_format(self, written):
+        path, h5py = written
+        with h5py.File(path) as f:
+            assert f["EMData/EBSDmaster/mLPNH"].shape == (1, 1, 41, 41)
+            assert f["EMData/EBSDmaster/mLPSH"].shape == (1, 1, 41, 41)
+            assert f["EMData/EBSDmaster/masterSPNH"].shape == (1, 41, 41)
+            assert f["CrystalData/AtomData"].shape[0] == 5
+            assert f["CrystalData/LatticeParameters"].shape == (6,)
+
+    def test_scalars_are_one_element_arrays(self, written):
+        # EMsoft writes Fortran rank-1 arrays and readers index them as
+        # `dataset[:][0]`, which raises on a true scalar dataspace.
+        path, h5py = written
+        with h5py.File(path) as f:
+            for name in [
+                "EMData/EBSDmaster/numset",
+                "EMData/EBSDmaster/numEbins",
+                "EMheader/EBSDmaster/ProgramName",
+                "CrystalData/SpaceGroupNumber",
+                "NMLparameters/EBSDMasterNameList/npx",
+            ]:
+                assert f[name].shape == (1,), name
+                f[name][:][0]  # must not raise
+
+    def test_writes_the_conventional_cell_in_nanometres(self, written):
+        # ase.build.bulk gives the primitive rhombohedral cell, whose axes
+        # would contradict the cubic space group recorded next to them.
+        path, h5py = written
+        with h5py.File(path) as f:
+            lattice = f["CrystalData/LatticeParameters"][()]
+            assert f["CrystalData/SpaceGroupNumber"][:][0] == 227
+            assert np.allclose(lattice[:3], 0.5431, atol=1e-4)  # nm, not Å
+            assert np.allclose(lattice[3:], 90.0)
+            assert f["CrystalData/CrystalSystem"][:][0] == 1  # cubic
+
+    def test_southern_hemisphere_is_the_centrosymmetric_image(self, written):
+        path, h5py = written
+        with h5py.File(path) as f:
+            north = f["EMData/EBSDmaster/mLPNH"][0, 0]
+            south = f["EMData/EBSDmaster/mLPSH"][0, 0]
+        assert np.array_equal(south, north[::-1, ::-1])
+
+    def test_energy_is_recorded_in_kev(self, written):
+        path, h5py = written
+        with h5py.File(path) as f:
+            assert f["EMData/EBSDmaster/EkeVs"][()] == pytest.approx([30.0])
+
+    def test_refuses_an_ensemble(self, tmp_path, silicon):
+        pytest.importorskip("h5py")
+        directions = SquareLambertProjection().grid(21)
+        pattern = SphericalPattern(
+            np.ones((2, len(directions))),
+            directions,
+            ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))],
+            metadata={"energy": 30e3},
+        )
+        with pytest.raises(ValueError, match="only a single pattern"):
+            write_emsoft_master_pattern(
+                str(tmp_path / "m.h5"), pattern, silicon, npx=10
+            )
+
+    def test_requires_an_energy(self, tmp_path, silicon):
+        pytest.importorskip("h5py")
+        directions = SquareLambertProjection().grid(21)
+        pattern = SphericalPattern(np.ones(len(directions)), directions)
+        with pytest.raises(ValueError, match="no energy"):
+            write_emsoft_master_pattern(
+                str(tmp_path / "m.h5"), pattern, silicon, npx=10
+            )
+
+    def test_rejects_an_impossible_space_group(self, tmp_path, pattern, silicon):
+        pytest.importorskip("h5py")
+        with pytest.raises(ValueError, match="between 1 and 230"):
+            write_emsoft_master_pattern(
+                str(tmp_path / "m.h5"), pattern, silicon, npx=10, space_group=300
+            )
