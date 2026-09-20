@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Sequence, cast
 
 import numpy as np
@@ -12,11 +13,16 @@ from abtem.core.utils import CopyMixin, EqualityMixin
 from abtem.ebsd.projections import (
     HemisphereProjection,
     bin_directions,
+    pixel_centers,
     validate_projection,
 )
 from abtem.measurements import Images
 
-__all__ = ["ReferencePatternImages", "SphericalPattern"]
+__all__ = ["ReferencePatternImages", "SphericalPattern", "SparseProjectionWarning"]
+
+
+class SparseProjectionWarning(UserWarning):
+    """The projected image has pixels no sampled direction reached."""
 
 
 class ReferencePatternImages(Images):
@@ -148,13 +154,16 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         projection = validate_projection(projection)
 
         flat = self._array.reshape(-1, len(self._directions))
-        images = np.stack(
-            [
-                bin_directions(self._directions, values, gpts, projection)
-                for values in flat
-            ]
-        )
+        binned = [
+            bin_directions(
+                self._directions, values, gpts, projection, return_counts=True
+            )
+            for values in flat
+        ]
+        images = np.stack([image for image, _ in binned])
         images = images.reshape(self.ensemble_shape + (gpts, gpts))
+
+        self._warn_if_sparse(binned[0][1], gpts, projection)
 
         return ReferencePatternImages(
             images,
@@ -162,6 +171,29 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             ensemble_axes_metadata=self.ensemble_axes_metadata,
             metadata={**self._metadata, "projection": projection.name},
         )
+
+    @staticmethod
+    def _warn_if_sparse(counts, gpts, projection, tolerance=0.01):
+        """Warn if the image has holes the directions never reached.
+
+        Directions sampled on one projection's even grid are uneven in any
+        other, so projecting a pattern through a projection it was not sampled
+        for leaves a moire of empty pixels. Pixels outside the projection's
+        domain -- the corners the stereographic disk does not cover -- are
+        legitimately empty and do not count.
+        """
+        inside = projection.domain_mask(pixel_centers(gpts)).reshape(gpts, gpts)
+        if not inside.any():
+            return
+
+        empty = float((counts[inside] == 0).mean())
+        if empty > tolerance:
+            warnings.warn(
+                f"{empty:.1%} of the pixels inside the {projection.name} "
+                f"projection have no sampled direction in them. Sample the "
+                f"directions in the projection you mean to view, or lower gpts.",
+                SparseProjectionWarning,
+            )
 
     def show(
         self,

@@ -1,7 +1,11 @@
 """Electron backscatter diffraction (EBSD) by multislice reciprocity."""
 
 from abtem.ebsd.detectors import BackscatterDetector, small_angle_error
-from abtem.ebsd.measurements import ReferencePatternImages, SphericalPattern
+from abtem.ebsd.measurements import (
+    ReferencePatternImages,
+    SparseProjectionWarning,
+    SphericalPattern,
+)
 from abtem.ebsd.orientations import (
     bulk_block,
     estimate_repetitions,
@@ -14,6 +18,7 @@ from abtem.ebsd.projections import (
     SquareLambertProjection,
     StereographicProjection,
     bin_directions,
+    pixel_centers,
     validate_projection,
 )
 from abtem.ebsd.reciprocity import EBSD
@@ -32,6 +37,8 @@ __all__ = [
     "small_angle_error",
     "SphericalPattern",
     "ReferencePatternImages",
+    "SparseProjectionWarning",
+    "pixel_centers",
     "fibonacci_hemisphere",
     "zone_axis_rotation",
     "bulk_block",

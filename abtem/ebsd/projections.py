@@ -33,6 +33,7 @@ import numpy as np
 
 __all__ = [
     "HemisphereProjection",
+    "pixel_centers",
     "StereographicProjection",
     "SquareLambertProjection",
     "validate_projection",
@@ -266,12 +267,33 @@ def validate_projection(
         ) from None
 
 
+def pixel_centers(gpts: int) -> np.ndarray:
+    """Centers of the pixels a square image of `gpts` covers ``[-1, 1]`` with.
+
+    Parameters
+    ----------
+    gpts : int
+        Number of pixels along each axis.
+
+    Returns
+    -------
+    xy : np.ndarray
+        Coordinates of shape ``(gpts ** 2, 2)``, ordered to match the raveled
+        image.
+    """
+    edges = np.linspace(-1.0, 1.0, gpts + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    x, y = np.meshgrid(centers, centers, indexing="ij")
+    return np.stack([x.ravel(), y.ravel()], axis=1)
+
+
 def bin_directions(
     directions: np.ndarray,
     values: np.ndarray,
     gpts: int,
     projection: str | HemisphereProjection = "stereographic",
-) -> np.ndarray:
+    return_counts: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Bin values sampled at directions into a square image.
 
     Directions in the southern hemisphere are dropped. Pixels that no direction
@@ -287,12 +309,17 @@ def bin_directions(
         Number of pixels along each axis of the output image.
     projection : str or HemisphereProjection, optional
         Projection used to place each direction in the image.
+    return_counts : bool, optional
+        If True, also return how many directions fell into each pixel, which
+        is what tells an empty pixel from a genuinely zero one.
 
     Returns
     -------
     image : np.ndarray
         Array of shape ``(gpts, gpts)`` holding the mean of the values falling
         in each pixel.
+    counts : np.ndarray
+        Directions per pixel, same shape. Only if `return_counts` is True.
     """
     projection = validate_projection(projection)
 
@@ -317,4 +344,9 @@ def bin_directions(
     )
     counts, _, _ = np.histogram2d(xy[:, 0], xy[:, 1], bins=gpts, range=limits)
 
-    return np.divide(total, counts, out=np.zeros_like(total), where=counts > 0)
+    image = np.divide(total, counts, out=np.zeros_like(total), where=counts > 0)
+
+    if return_counts:
+        return image, counts
+
+    return image

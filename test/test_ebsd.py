@@ -1,3 +1,5 @@
+import warnings
+
 import ase
 import numpy as np
 import pytest
@@ -7,6 +9,7 @@ from abtem.core.axes import OrdinalAxis
 from abtem.ebsd import (
     EBSD,
     BackscatterDetector,
+    SparseProjectionWarning,
     SphericalPattern,
     SquareLambertProjection,
     StereographicProjection,
@@ -14,6 +17,7 @@ from abtem.ebsd import (
     bulk_block,
     estimate_repetitions,
     fibonacci_hemisphere,
+    pixel_centers,
     rotated_slab,
     validate_projection,
     zone_axis_rotation,
@@ -338,7 +342,11 @@ class TestSphericalPattern:
         )
 
     def test_project_shape_and_axes(self, pattern):
-        images = pattern.project(32)
+        # A Fibonacci lattice is not a projection grid, so the binned image has
+        # holes; that is what TestSparseProjection covers, not this.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SparseProjectionWarning)
+            images = pattern.project(32)
         assert images.array.shape == (32, 32)
         assert [axis.units for axis in images.base_axes_metadata] == ["", ""]
         assert images.metadata["projection"] == "stereographic"
@@ -349,7 +357,9 @@ class TestSphericalPattern:
         pattern = SphericalPattern(
             array, directions, ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))]
         )
-        images = pattern.project(16)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SparseProjectionWarning)
+            images = pattern.project(16)
         assert images.array.shape == (2, 16, 16)
         assert images.array[1].max() == pytest.approx(2.0)
 
@@ -730,7 +740,11 @@ class TestEBSDReferencePattern:
         assert metadata["projection"] == "stereographic"
 
     def test_compute_projects_to_an_image(self, builder):
-        images = builder.compute(pbar=False).project(8)
+        # One patch covers a cap, not the hemisphere, so most of the image is
+        # empty by construction.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SparseProjectionWarning)
+            images = builder.compute(pbar=False).project(8)
         assert images.array.shape == (8, 8)
         assert np.all(np.isfinite(images.array))
 
@@ -771,3 +785,66 @@ class TestDetectorRecommendedSampling:
             sampling=detector.recommended_sampling(30e3),
         ).scan()
         assert patterns.metadata["antialias_loss_max"] < 0.05
+
+
+class TestSparseProjection:
+    @staticmethod
+    def pattern_sampled_in(projection, gpts=128):
+        directions = validate_projection(projection).grid(gpts)
+        return SphericalPattern(1.0 + directions[:, 2], directions)
+
+    @pytest.mark.parametrize("projection", ["stereographic", "lambert"])
+    def test_matching_projection_does_not_warn(self, projection):
+        pattern = self.pattern_sampled_in(projection, gpts=148)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SparseProjectionWarning)
+            pattern.project(128, projection)
+
+    @pytest.mark.parametrize(
+        "sampled, viewed",
+        [("stereographic", "lambert"), ("lambert", "stereographic")],
+    )
+    def test_mismatched_projection_warns(self, sampled, viewed):
+        # An even grid in one projection is uneven in the other, so binning
+        # through the wrong one leaves a moire of empty pixels.
+        pattern = self.pattern_sampled_in(sampled, gpts=148)
+        with pytest.warns(SparseProjectionWarning, match="no sampled direction"):
+            pattern.project(128, viewed)
+
+    def test_too_many_pixels_warns(self):
+        pattern = self.pattern_sampled_in("lambert", gpts=32)
+        with pytest.warns(SparseProjectionWarning):
+            pattern.project(256, "lambert")
+
+    def test_stereographic_corners_do_not_count_as_holes(self):
+        # The corners outside the disk are legitimately empty; only pixels
+        # inside the projection's domain are holes.
+        pattern = self.pattern_sampled_in("stereographic", gpts=148)
+        image = pattern.project(128, "stereographic")
+        assert np.count_nonzero(image.array) < 128**2
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SparseProjectionWarning)
+            pattern.project(128, "stereographic")
+
+
+class TestPixelCenters:
+    def test_spans_the_square_without_touching_the_edges(self):
+        centers = pixel_centers(4)
+        assert centers.shape == (16, 2)
+        assert centers[:, 0].min() == pytest.approx(-0.75)
+        assert centers[:, 0].max() == pytest.approx(0.75)
+
+    def test_ordering_matches_the_raveled_image(self):
+        gpts = 5
+        centers = pixel_centers(gpts).reshape(gpts, gpts, 2)
+        # first axis varies x, second varies y, as histogram2d bins them
+        assert centers[1, 0, 0] < centers[2, 0, 0]
+        assert centers[0, 1, 1] < centers[0, 2, 1]
+
+    def test_bin_directions_counts(self):
+        directions = np.array([[0.0, 0.0, 1.0]])
+        image, counts = bin_directions(
+            directions, np.array([7.0]), gpts=4, return_counts=True
+        )
+        assert counts.sum() == 1
+        assert image[counts > 0] == pytest.approx(7.0)
