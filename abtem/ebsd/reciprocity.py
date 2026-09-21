@@ -172,6 +172,52 @@ def _build_potential(potential: BasePotential) -> BasePotential:
     return potential.build(lazy=False)
 
 
+def _potential_configurations(
+    potential: BasePotential,
+) -> list[tuple[BasePotential, float]]:
+    """Split a potential into its frozen-phonon configurations and their weights.
+
+    A potential built on :class:`~abtem.FrozenPhonons` or
+    :class:`~abtem.AtomsEnsemble` carries an ensemble axis, and the propagation
+    below runs on one configuration at a time -- so the axis has to be taken
+    apart here rather than left for ``generate_slices``, which would silently
+    walk the first configuration only.
+
+    The configurations are averaged with equal weight, which is what a
+    backscattered yield is: an incoherent sum over the thermal displacements
+    the specimen passes through, not a coherent one. A configuration axis is
+    therefore never carried through to the measurement, and an ensemble asked
+    to keep one says so.
+
+    Returns
+    -------
+    configurations : list of (BasePotential, float)
+        Single-configuration potentials and the weight each carries. A
+        potential with no ensemble axis gives the single pair
+        ``[(potential, 1.0)]``.
+    """
+    ensemble_shape = potential.ensemble_shape
+
+    if len(ensemble_shape) == 0:
+        return [(potential, 1.0)]
+
+    if any(not getattr(axis, "_ensemble_mean", True)
+           for axis in potential.ensemble_axes_metadata):
+        warnings.warn(
+            "the potential asks to keep its configurations separate, but a "
+            "backscattered yield is an incoherent sum over them; they are "
+            "averaged",
+            UserWarning,
+        )
+
+    configurations = [
+        block.ravel()[0] for _, _, block in potential.generate_blocks(1)
+    ]
+    weight = 1.0 / len(configurations)
+
+    return [(configuration, weight) for configuration in configurations]
+
+
 def _propagate_block_intensities(
     ebsd: "EBSD", potential: BasePotential, arguments: dict
 ) -> np.ndarray:
@@ -400,17 +446,18 @@ class EBSD(CopyMixin, EqualityMixin):
 
         xp = get_array_module(self._device)
 
-        # Only the geometry is needed to lay out the work; building the
-        # potential is deferred when lazy, so that 400 of them are neither
-        # built serially while the graph is assembled nor held in it at once.
+        # Only the geometry is needed to lay out the work, and every frozen
+        # -phonon configuration shares it. Building each one is deferred to the
+        # point of use, so that 400 of them are neither built serially while
+        # the graph is assembled nor held in it at once.
         num_slices = self._potential.num_slices
-        potential = self._potential if lazy else self._potential.build(lazy=False)
+        configurations = _potential_configurations(self._potential)
 
         depths = np.cumsum(np.asarray(self._potential.slice_thickness, dtype=float))
         weights = _validate_depth_weight(self._depth_weight, depths)
 
         probe = self._probe.copy()
-        probe.grid.match(potential)
+        probe.grid.match(self._potential)
         energy = probe._valid_energy
 
         source = probe.build(scan=scan, lazy=False)
@@ -451,7 +498,7 @@ class EBSD(CopyMixin, EqualityMixin):
 
         if lazy:
             return self._lazy_measurement(
-                potential=potential,
+                configurations=configurations,
                 block_arguments=block_arguments,
                 blocks=blocks,
                 backscatter_energies=backscatter_energies,
@@ -467,18 +514,22 @@ class EBSD(CopyMixin, EqualityMixin):
         antialias_loss = xp.zeros((n_energies, len(self._detector)), dtype=xp.float32)
 
         progress = TqdmWrapper(
-            total=n_energies * len(blocks) * num_slices, enabled=pbar, leave=False
+            total=len(configurations) * n_energies * len(blocks) * num_slices,
+            enabled=pbar,
+            leave=False,
         )
         try:
-            for i, backscatter_energy in enumerate(backscatter_energies):
-                for start, stop in blocks:
-                    block, loss = self._propagate_block(
-                        potential=potential,
-                        progress=progress,
-                        **block_arguments(backscatter_energy, start, stop),
-                    )
-                    intensities[i][..., start:stop] = block
-                    antialias_loss[i][start:stop] = loss
+            for configuration, configuration_weight in configurations:
+                built = configuration.build(lazy=False)
+                for i, backscatter_energy in enumerate(backscatter_energies):
+                    for start, stop in blocks:
+                        block, loss = self._propagate_block(
+                            potential=built,
+                            progress=progress,
+                            **block_arguments(backscatter_energy, start, stop),
+                        )
+                        intensities[i][..., start:stop] += configuration_weight * block
+                        antialias_loss[i][start:stop] += configuration_weight * loss
         finally:
             progress.close_if_exists()
 
@@ -505,7 +556,7 @@ class EBSD(CopyMixin, EqualityMixin):
 
     def _lazy_measurement(
         self,
-        potential,
+        configurations,
         block_arguments,
         blocks,
         backscatter_energies,
@@ -516,37 +567,41 @@ class EBSD(CopyMixin, EqualityMixin):
     ) -> DiffractionPatterns | SphericalPattern:
         """Assemble the same per-block computation into a dask graph.
 
-        Each block of directions, at each backscattered energy, is one task.
-        They share the built potential and the source, which the threaded
-        scheduler passes by reference rather than copying. The wavefields a
-        task propagates are its own, so only one block of them is resident at a
-        time however many directions were asked for.
+        Each block of directions, at each backscattered energy and each frozen
+        -phonon configuration, is one task. The blocks of a configuration share
+        its built potential and the source, which the threaded scheduler passes
+        by reference rather than copying. The wavefields a task propagates are
+        its own, so only one block of them is resident at a time however many
+        directions were asked for.
         """
         import dask
 
         n_energies = len(backscatter_energies)
 
-        # One task, so the blocks of this patch share the built potential and
-        # dask frees it once they are done with it.
-        built = dask.delayed(_build_potential, pure=True)(potential)
+        array = None
+        for configuration, configuration_weight in configurations:
+            # One task per configuration, so its blocks share the built
+            # potential and dask frees it once they are done with it.
+            built = dask.delayed(_build_potential, pure=True)(configuration)
 
-        rows = []
-        for backscatter_energy in backscatter_energies:
-            columns = []
-            for start, stop in blocks:
-                block = dask.delayed(_propagate_block_intensities, pure=True)(
-                    self, built, block_arguments(backscatter_energy, start, stop)
-                )
-                columns.append(
-                    da.from_delayed(
-                        block,
-                        shape=ensemble_shape + (stop - start,),
-                        dtype=np.float32,
+            rows = []
+            for backscatter_energy in backscatter_energies:
+                columns = []
+                for start, stop in blocks:
+                    block = dask.delayed(_propagate_block_intensities, pure=True)(
+                        self, built, block_arguments(backscatter_energy, start, stop)
                     )
-                )
-            rows.append(da.concatenate(columns, axis=-1))
+                    columns.append(
+                        da.from_delayed(
+                            block,
+                            shape=ensemble_shape + (stop - start,),
+                            dtype=np.float32,
+                        )
+                    )
+                rows.append(da.concatenate(columns, axis=-1))
 
-        array = da.stack(rows, axis=0)
+            stacked = configuration_weight * da.stack(rows, axis=0)
+            array = stacked if array is None else array + stacked
 
         if n_energies == 1:
             array = array[0]

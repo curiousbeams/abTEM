@@ -567,6 +567,48 @@ class TestEBSD:
         assert np.allclose(from_explicit.directions, grid.directions)
         assert np.allclose(from_grid.array.ravel(), from_explicit.array, rtol=1e-6)
 
+    @pytest.mark.parametrize("lazy", [False, True])
+    def test_frozen_phonon_configurations_are_averaged(self, lazy):
+        # A potential built on an ensemble carries a configuration axis that
+        # the propagation cannot see, so it has to be taken apart before
+        # generate_slices, which would otherwise walk the first configuration
+        # and silently return it alone.
+        rng = np.random.default_rng(0)
+        trajectory = []
+        for _ in range(3):
+            configuration = silicon_slab()
+            configuration.positions += rng.normal(
+                scale=0.2, size=configuration.positions.shape
+            )
+            trajectory.append(configuration)
+
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        separately = [
+            np.asarray(make_ebsd(atoms, detector).scan().array)
+            for atoms in trajectory
+        ]
+
+        ensemble = make_ebsd(
+            abtem.AtomsEnsemble(trajectory), detector
+        ).scan(lazy=lazy)
+        if lazy:
+            ensemble = ensemble.compute(progress_bar=False)
+
+        assert ensemble.array.shape == (4, 4)
+        assert np.allclose(ensemble.array, np.mean(separately, axis=0), rtol=1e-5)
+        # and it is an average, not the first configuration
+        assert not np.allclose(ensemble.array, separately[0], rtol=1e-3)
+
+    def test_an_ensemble_kept_separate_warns_that_it_is_averaged(self):
+        trajectory = [silicon_slab(), silicon_slab()]
+        trajectory[1].positions += 0.2
+
+        with pytest.warns(UserWarning, match="incoherent sum"):
+            make_ebsd(
+                abtem.AtomsEnsemble(trajectory, ensemble_mean=False),
+                BackscatterDetector(max_angle=50, gpts=4),
+            ).scan()
+
     def test_scan_adds_a_leading_ensemble_axis(self):
         scan = abtem.CustomScan([[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]])
         patterns = make_ebsd(
