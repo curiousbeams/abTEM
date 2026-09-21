@@ -1193,3 +1193,24 @@ class TestSamplingEstimators:
         )
         assert builder.sampling == pytest.approx(potential_sampling(silicon))
         assert builder.sampling < maximum_sampling(30e3, builder.max_angle)
+
+    def test_the_estimate_is_converged_in_its_own_grid(self):
+        # The measuring grid has to reach well past the cutoff it is looking
+        # for, or the tail it misses shifts the answer. Pin that it is close
+        # to the limit rather than still drifting.
+        from abtem.ebsd.reference import _scattering_power_cutoff
+
+        _scattering_power_cutoff.cache_clear()
+        coarse_grid_estimate = 0.0659  # what a 512-point measuring grid gives
+        assert potential_sampling(
+            ase.build.bulk("Si", "diamond", a=5.431)
+        ) < coarse_grid_estimate
+
+    def test_repeated_calls_are_cached(self):
+        from abtem.ebsd.reference import _scattering_power_cutoff
+
+        silicon = ase.build.bulk("Si", "diamond", a=5.431)
+        potential_sampling(silicon)
+        before = _scattering_power_cutoff.cache_info().hits
+        potential_sampling(silicon)
+        assert _scattering_power_cutoff.cache_info().hits > before

@@ -163,7 +163,14 @@ def _scattering_power_cutoff(number: int, tolerance: float) -> float:
     there is no frequency beyond which it truly vanishes. What can be asked is
     where all but a given fraction of its power lies.
     """
-    extent, gpts, thickness = 8.0, 512, 2.0
+    # The tail of the spectrum matters to the total power, so the measuring
+    # grid has to reach well past the cutoff it is looking for. Converging on
+    # silicon: 512 points gives 0.066 A, 1024 gives 0.063, 2048 gives 0.062 and
+    # 4096 gives 0.0619. 1024 is within about 1.5% of the limit for light
+    # elements and 3% for gold, and costs a quarter of a second once per
+    # element. The slice thickness makes no difference at all for an isolated
+    # atom, and the box only a couple of percent.
+    extent, gpts, thickness = 8.0, 1024, 2.0
 
     atoms = Atoms(
         numbers=[number],
