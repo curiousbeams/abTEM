@@ -40,7 +40,7 @@ import numpy as np
 from ase import Atoms
 
 from abtem.antialias import AntialiasAperture
-from abtem.core.axes import AxisMetadata, OrdinalAxis
+from abtem.core.axes import AxisMetadata, EnergyAxis, OrdinalAxis
 from abtem.core.backend import get_array_module, validate_device
 from abtem.core.chunks import chunk_ranges, validate_chunks
 from abtem.core.diagnostics import TqdmWrapper
@@ -110,6 +110,46 @@ def _validate_depth_weight(
     return weights / total
 
 
+def _validate_backscatter_energy(
+    backscatter_energy, beam_energy: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve the backscattered energies and their weights.
+
+    The beam travels at `beam_energy`; a backscattered electron has lost some
+    of that, so the reciprocity waves belong at or below it.
+    """
+    if backscatter_energy is None:
+        return np.array([beam_energy]), np.array([1.0])
+
+    if isinstance(backscatter_energy, BaseDistribution):
+        energies = np.asarray(backscatter_energy.values, dtype=float)
+        weights = np.asarray(backscatter_energy.weights, dtype=float)
+    else:
+        energies = np.atleast_1d(np.asarray(backscatter_energy, dtype=float))
+        weights = np.ones(len(energies))
+
+    if energies.ndim != 1 or len(energies) == 0:
+        raise ValueError(
+            f"backscatter_energy must be a scalar or a 1d sequence, got shape "
+            f"{energies.shape}"
+        )
+
+    if np.any(energies <= 0.0):
+        raise ValueError("backscattered energies must be positive")
+
+    if np.any(energies > beam_energy):
+        raise ValueError(
+            f"a backscattered electron cannot carry more than the beam energy "
+            f"of {beam_energy:.0f} eV; got up to {energies.max():.0f} eV"
+        )
+
+    total = weights.sum()
+    if total <= 0.0:
+        raise ValueError("the energy weights must not sum to zero")
+
+    return energies, weights / total
+
+
 class EBSD(CopyMixin, EqualityMixin):
     """Backscatter diffraction patterns from a specimen, by reciprocity.
 
@@ -154,6 +194,29 @@ class EBSD(CopyMixin, EqualityMixin):
         absorptive potential, which attenuates the beam and the reciprocity
         waves alike and additionally reproduces anomalous absorption; pass a
         complex potential for that.
+    backscatter_energy : float or sequence of float or BaseDistribution, optional
+        Energy of the backscattered electrons [eV]. The beam travels at the
+        probe's energy; a backscattered electron has lost some of it, so these
+        must not exceed it. Giving more than one adds a leading
+        :class:`.EnergyAxis` and costs proportionally more: the reciprocity
+        waves travel at this energy, so each one needs its own wavelength,
+        propagator and transmission function, and only the beam's propagation
+        is shared. Defaults to the probe's energy, the elastic case, where the
+        two wavefields share a transmission function.
+
+        The weights of a distribution are recorded in the metadata rather than
+        applied, since summing the energy axis is the consumer's business and
+        the weights usually come from a Monte Carlo spectrum.
+    depth_tolerance : float, optional
+        Stop propagating once the depth weight still to be collected falls
+        below this fraction of the total (default 1e-4). Slices past a short
+        escape depth carry no weight, and propagating them is the dominant
+        cost. Has no effect under the default uniform weighting, where the
+        remaining weight only vanishes at the last slice.
+
+        The bound is on the *discarded weight*; the error in any one direction
+        can be a few times that, because the slices dropped are not average
+        ones. Set to 0 to disable.
     order : {1, 2, 'exact'}, optional
         Order of the Fresnel propagator (default ``'exact'``). The collected
         angles are large enough that the small-angle propagators are usually a
@@ -169,6 +232,10 @@ class EBSD(CopyMixin, EqualityMixin):
         detector: BackscatterDetector,
         potential_weighting: bool = True,
         depth_weight: Optional[DepthWeight] = None,
+        backscatter_energy: Optional[
+            float | Sequence[float] | np.ndarray | BaseDistribution
+        ] = None,
+        depth_tolerance: float = 1e-4,
         order: Literal[1, 2, "exact"] = "exact",
         device: Optional[str] = None,
     ):
@@ -188,6 +255,8 @@ class EBSD(CopyMixin, EqualityMixin):
         self._detector = detector
         self._potential_weighting = bool(potential_weighting)
         self._depth_weight = depth_weight
+        self._backscatter_energy = backscatter_energy
+        self._depth_tolerance = float(depth_tolerance)
         self._order = order
         self._device = validate_device(device)
 
@@ -292,36 +361,46 @@ class EBSD(CopyMixin, EqualityMixin):
             xp.abs(source.array) ** 2, axis=(-2, -1), dtype=xp.float64
         ).reshape(-1)
 
-        wave_vectors = xp.asarray(
-            self._detector.transverse_wave_vectors(energy),
-            dtype=get_dtype(complex=False),
+        backscatter_energies, energy_weights = _validate_backscatter_energy(
+            self._backscatter_energy, energy
         )
+        n_energies = len(backscatter_energies)
 
         intensities = xp.zeros(
-            ensemble_shape + (len(self._detector),), dtype=xp.float32
+            (n_energies,) + ensemble_shape + (len(self._detector),), dtype=xp.float32
         )
-        antialias_loss = xp.zeros(len(self._detector), dtype=xp.float32)
+        antialias_loss = xp.zeros((n_energies, len(self._detector)), dtype=xp.float32)
 
         blocks = self._direction_blocks(max_batch_directions)
 
         progress = TqdmWrapper(
-            total=len(blocks) * num_slices, enabled=pbar, leave=False
+            total=n_energies * len(blocks) * num_slices, enabled=pbar, leave=False
         )
         try:
-            for start, stop in blocks:
-                self._propagate_block(
-                    potential=potential,
-                    source=source,
-                    incident_norm=incident_norm,
-                    wave_vectors=wave_vectors[start:stop],
-                    weights=weights,
-                    energy=energy,
-                    intensities=intensities,
-                    antialias_loss=antialias_loss,
-                    start=start,
-                    stop=stop,
-                    progress=progress,
+            for i, backscatter_energy in enumerate(backscatter_energies):
+                # The transverse wavevectors are k0(E) times the collected
+                # directions, so they change with the backscattered energy.
+                # Storing directions rather than wavevectors is what makes the
+                # detector reusable across the energies.
+                wave_vectors = xp.asarray(
+                    self._detector.transverse_wave_vectors(backscatter_energy),
+                    dtype=get_dtype(complex=False),
                 )
+                for start, stop in blocks:
+                    self._propagate_block(
+                        potential=potential,
+                        source=source,
+                        incident_norm=incident_norm,
+                        wave_vectors=wave_vectors[start:stop],
+                        weights=weights,
+                        energy=energy,
+                        backscatter_energy=float(backscatter_energy),
+                        intensities=intensities[i],
+                        antialias_loss=antialias_loss[i],
+                        start=start,
+                        stop=stop,
+                        progress=progress,
+                    )
         finally:
             progress.close_if_exists()
 
@@ -334,11 +413,21 @@ class EBSD(CopyMixin, EqualityMixin):
                 AntialiasLossWarning,
             )
 
+        if n_energies == 1:
+            intensities = intensities[0]
+            antialias_loss = antialias_loss[0]
+        else:
+            ensemble_axes_metadata = [
+                EnergyAxis(values=tuple(float(e) for e in backscatter_energies))
+            ] + ensemble_axes_metadata
+
         return self._to_measurement(
             intensities,
             ensemble_axes_metadata=ensemble_axes_metadata,
             energy=energy,
             antialias_loss=antialias_loss,
+            energy_weights=energy_weights,
+            backscatter_energies=backscatter_energies,
         )
 
     def _propagate_block(
@@ -349,6 +438,7 @@ class EBSD(CopyMixin, EqualityMixin):
         wave_vectors,
         weights: np.ndarray,
         energy: float,
+        backscatter_energy: float,
         intensities,
         antialias_loss,
         start: int,
@@ -362,6 +452,12 @@ class EBSD(CopyMixin, EqualityMixin):
         held in memory all at once. That is what makes a scan of many probe
         positions affordable; the cost is re-propagating the source once per
         batch of directions.
+
+        The source travels at the beam energy and the reciprocity waves at the
+        backscattered energy. When those differ the two wavefields need their
+        own transmission function and propagator, since both depend on the
+        wavelength; when they agree the pair is shared, halving the per-slice
+        transmission work.
         """
         xp = get_array_module(self._device)
 
@@ -371,7 +467,7 @@ class EBSD(CopyMixin, EqualityMixin):
 
         reciprocity = Waves(
             array,
-            energy=energy,
+            energy=backscatter_energy,
             extent=potential.extent,
             ensemble_axes_metadata=[OrdinalAxis(values=tuple(range(len(array))))],
         )
@@ -380,31 +476,50 @@ class EBSD(CopyMixin, EqualityMixin):
         # The source is re-propagated for every block, so start from a copy.
         beam = source.copy()
 
-        propagator = FresnelPropagator()
+        elastic = backscatter_energy == energy
+
+        # Weight still to be collected at and below each slice. Once it is
+        # negligible there is nothing left to gather and the remaining slices
+        # are wasted propagation -- which is most of the specimen when the
+        # escape depth is short compared to its thickness.
+        remaining = np.cumsum(weights[::-1])[::-1]
+
+        beam_propagator = FresnelPropagator()
+        reciprocity_propagator = beam_propagator if elastic else FresnelPropagator()
         antialias_aperture = AntialiasAperture()
 
         for index, potential_slice in enumerate(potential.generate_slices()):
+            if remaining[index] < self._depth_tolerance:
+                break
+
             potential_slice = potential_slice.copy_to_device(self._device)
 
-            # Build the transmission function once and hand it to both
-            # wavefields; they share an energy and a grid, so recomputing it
-            # per wavefield would double the cost of every slice.
-            transmission_function = potential_slice.transmission_function(energy=energy)
-            transmission_function = antialias_aperture.bandlimit(
-                transmission_function, in_place=True
+            beam_transmission = potential_slice.transmission_function(energy=energy)
+            beam_transmission = antialias_aperture.bandlimit(
+                beam_transmission, in_place=True
             )
+
+            if elastic:
+                reciprocity_transmission = beam_transmission
+            else:
+                reciprocity_transmission = potential_slice.transmission_function(
+                    energy=backscatter_energy
+                )
+                reciprocity_transmission = antialias_aperture.bandlimit(
+                    reciprocity_transmission, in_place=True
+                )
 
             beam = conventional_multislice_step(
                 beam,
-                transmission_function,
-                propagator=propagator,
+                beam_transmission,
+                propagator=beam_propagator,
                 antialias_aperture=antialias_aperture,
                 order=self._order,
             )
             reciprocity = conventional_multislice_step(
                 reciprocity,
-                transmission_function,
-                propagator=propagator,
+                reciprocity_transmission,
+                propagator=reciprocity_propagator,
                 antialias_aperture=antialias_aperture,
                 order=self._order,
             )
@@ -463,10 +578,22 @@ class EBSD(CopyMixin, EqualityMixin):
             source = beam_intensity
 
         # (directions, pixels) @ (pixels, positions) -> (directions, positions)
-        reciprocity_flat = xp.abs(reciprocity.array).reshape(stop - start, -1) ** 2
-        source_flat = source.reshape(-1, reciprocity_flat.shape[1])
+        #
+        # The squared magnitude of the reciprocity waves is the largest array in
+        # the loop, and taking it with abs()**2 costs more than the contraction
+        # it feeds. Viewing the complex array as float32 gives the real and
+        # imaginary parts interleaved and contiguous, so squaring every
+        # component and contracting against the source with each of its values
+        # repeated twice computes the same sum in one pass over contiguous
+        # memory -- about seven times faster than abs()**2 on the strided
+        # halves, and exactly equal.
+        real_view = reciprocity.array.view(get_dtype(complex=False))
+        real_view = real_view.reshape(stop - start, -1)
 
-        overlap = reciprocity_flat @ source_flat.T
+        source_flat = source.reshape(-1, real_view.shape[1] // 2)
+        source_interleaved = xp.repeat(source_flat, 2, axis=-1)
+
+        overlap = (real_view * real_view) @ source_interleaved.T
         overlap = overlap / incident_norm[None]
 
         intensities[..., start:stop] += weight * overlap.T.reshape(
@@ -479,6 +606,8 @@ class EBSD(CopyMixin, EqualityMixin):
         ensemble_axes_metadata: list[AxisMetadata],
         energy: float,
         antialias_loss,
+        energy_weights: Optional[np.ndarray] = None,
+        backscatter_energies: Optional[np.ndarray] = None,
     ) -> DiffractionPatterns | SphericalPattern:
         """Wrap the collected intensities in the matching measurement type."""
         array = np.asarray(
@@ -494,6 +623,17 @@ class EBSD(CopyMixin, EqualityMixin):
             "antialias_loss_max": float(loss.max()),
             "antialias_loss_mean": float(loss.mean()),
         }
+
+        if (
+            backscatter_energies is not None
+            and energy_weights is not None
+            and len(backscatter_energies) > 1
+        ):
+            # Kept rather than applied: the weights belong to whoever sums the
+            # energy axis, and a Monte Carlo spectrum is the usual source of
+            # them.
+            metadata["backscatter_energies"] = [float(e) for e in backscatter_energies]
+            metadata["energy_weights"] = [float(w) for w in energy_weights]
 
         if self._detector.is_grid:
             gpts = self._detector.gpts

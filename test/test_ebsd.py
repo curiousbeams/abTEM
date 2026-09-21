@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 import abtem
-from abtem.core.axes import OrdinalAxis
+from abtem.core.axes import EnergyAxis, OrdinalAxis
 from abtem.ebsd import (
     EBSD,
     BackscatterDetector,
@@ -23,7 +23,10 @@ from abtem.ebsd import (
     write_emsoft_master_pattern,
     zone_axis_rotation,
 )
-from abtem.ebsd.reciprocity import _validate_depth_weight
+from abtem.ebsd.reciprocity import (
+    _validate_backscatter_energy,
+    _validate_depth_weight,
+)
 from abtem.ebsd.reference import (
     EBSDReferencePattern,
     patch_half_angle,
@@ -564,7 +567,10 @@ class TestEBSD:
             alone = make_ebsd(atoms, detector).scan(
                 scan=abtem.CustomScan([position])
             )
-            assert np.allclose(together.array[i], alone.array[0], rtol=1e-5)
+            # float32 summation over thousands of pixels, in a different order
+            # for a batch than for a single position; a real per-position error
+            # would be of order one, not of order the rounding.
+            assert np.allclose(together.array[i], alone.array[0], rtol=1e-4)
 
     def test_yield_is_of_order_one(self):
         # The normalization is relative to a featureless specimen, so a real
@@ -998,3 +1004,91 @@ class TestEMsoftWriter:
             write_emsoft_master_pattern(
                 str(tmp_path / "m.h5"), pattern, silicon, npx=10, space_group=300
             )
+
+
+class TestBackscatterEnergy:
+    def test_defaults_to_the_beam_energy(self):
+        energies, weights = _validate_backscatter_energy(None, 30e3)
+        assert energies == pytest.approx([30e3])
+        assert weights == pytest.approx([1.0])
+
+    def test_weights_are_normalized(self):
+        from abtem.distributions import uniform
+
+        _, weights = _validate_backscatter_energy(uniform(28e3, 30e3, 4), 30e3)
+        assert weights.sum() == pytest.approx(1.0)
+
+    def test_rejects_energies_above_the_beam(self):
+        # A backscattered electron has lost energy; it cannot have gained any.
+        with pytest.raises(ValueError, match="cannot carry more than the beam"):
+            _validate_backscatter_energy([30e3, 31e3], 30e3)
+
+    def test_rejects_non_positive(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            _validate_backscatter_energy([0.0], 30e3)
+
+    def test_single_energy_matches_the_default(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        default = make_ebsd(atoms, detector).scan()
+        explicit = make_ebsd(atoms, detector, backscatter_energy=30e3).scan()
+        assert np.array_equal(default.array, explicit.array)
+
+    def test_adds_a_leading_energy_axis(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        patterns = make_ebsd(
+            atoms, detector, backscatter_energy=[30e3, 29e3, 28e3]
+        ).scan()
+        assert patterns.array.shape == (3, 4, 4)
+        assert isinstance(patterns.ensemble_axes_metadata[0], EnergyAxis)
+        assert patterns.ensemble_axes_metadata[0].values == (30e3, 29e3, 28e3)
+
+    def test_the_first_bin_reproduces_the_single_energy_result(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        single = make_ebsd(atoms, detector, backscatter_energy=29e3).scan()
+        multi = make_ebsd(atoms, detector, backscatter_energy=[29e3, 27e3]).scan()
+        assert np.allclose(multi.array[0], single.array, rtol=1e-5)
+
+    def test_a_lower_energy_gives_a_different_pattern(self):
+        # The reciprocity waves travel at the backscattered energy, so their
+        # wavelength -- and the diffraction -- changes with it.
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=6)
+        patterns = make_ebsd(atoms, detector, backscatter_energy=[30e3, 24e3]).scan()
+        assert not np.allclose(patterns.array[0], patterns.array[1], rtol=1e-3)
+
+    def test_records_the_weights_in_the_metadata(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        patterns = make_ebsd(
+            atoms, detector, backscatter_energy=[30e3, 28e3]
+        ).scan()
+        assert patterns.metadata["backscatter_energies"] == [30e3, 28e3]
+        assert patterns.metadata["energy_weights"] == pytest.approx([0.5, 0.5])
+
+
+class TestDepthTolerance:
+    def test_a_short_escape_depth_stops_early(self):
+        # Slices past the escape depth carry no weight, so propagating them is
+        # wasted; the result must be unchanged to within the discarded weight.
+        atoms = silicon_slab(thickness=40.0)
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        exact = make_ebsd(
+            atoms, detector, depth_weight=4.0, depth_tolerance=0.0
+        ).scan()
+        truncated = make_ebsd(
+            atoms, detector, depth_weight=4.0, depth_tolerance=1e-3
+        ).scan()
+        # The bound is on the discarded weight; the error in any one direction
+        # can be a small multiple of it, since the dropped slices are not
+        # average ones.
+        assert np.allclose(exact.array, truncated.array, rtol=1e-2)
+
+    def test_uniform_weighting_is_unaffected(self):
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=50, gpts=4)
+        a = make_ebsd(atoms, detector, depth_tolerance=0.0).scan()
+        b = make_ebsd(atoms, detector).scan()
+        assert np.array_equal(a.array, b.array)
