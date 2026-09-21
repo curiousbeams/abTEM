@@ -30,7 +30,9 @@ from abtem.ebsd.reciprocity import (
 from abtem.ebsd.reference import (
     EBSDReferencePattern,
     fft_friendly_gpts,
+    maximum_sampling,
     patch_half_angle,
+    potential_sampling,
     recommended_sampling,
 )
 
@@ -627,10 +629,10 @@ class TestPatchGeometry:
             patch_half_angle(0)
 
     @pytest.mark.parametrize("max_angle", [50.0, 132.0, 300.0])
-    def test_recommended_sampling_stays_inside_the_aperture(self, max_angle):
+    def test_maximum_sampling_stays_inside_the_aperture(self, max_angle):
         from abtem.core.energy import energy2wavelength
 
-        sampling = recommended_sampling(30e3, max_angle)
+        sampling = maximum_sampling(30e3, max_angle)
         k_collected = np.sin(max_angle * 1e-3) / energy2wavelength(30e3)
         k_aperture = 2.0 / 3.0 / (2.0 * sampling)
         assert k_collected < k_aperture
@@ -658,7 +660,11 @@ class TestEBSDReferencePattern:
         )
         assert builder.max_angle == pytest.approx(patch_half_angle(400))
         assert builder.sampling == pytest.approx(
-            recommended_sampling(30e3, patch_half_angle(400))
+            recommended_sampling(
+                30e3,
+                patch_half_angle(400),
+                atoms=ase.build.bulk("Si", "diamond", a=5.431),
+            )
         )
         assert len(builder.zone_axes) == 400
 
@@ -774,13 +780,13 @@ class TestDetectorRecommendedSampling:
         # the sampling from max_angle leaves them outside the antialias
         # aperture, where they lose essentially all their intensity.
         detector = BackscatterDetector(max_angle=150, gpts=64)
-        assert detector.recommended_sampling(30e3) < recommended_sampling(30e3, 150)
+        assert detector.maximum_sampling(30e3) < maximum_sampling(30e3, 150)
 
     def test_keeps_every_direction_inside_the_aperture(self):
         from abtem.core.energy import energy2wavelength
 
         detector = BackscatterDetector(max_angle=150, gpts=64)
-        sampling = detector.recommended_sampling(30e3)
+        sampling = detector.maximum_sampling(30e3)
 
         k_corner = np.sin(detector.max_scattering_angle) / energy2wavelength(30e3)
         assert k_corner < 2.0 / 3.0 / (2.0 * sampling)
@@ -790,7 +796,7 @@ class TestDetectorRecommendedSampling:
         patterns = make_ebsd(
             silicon_slab(),
             detector,
-            sampling=detector.recommended_sampling(30e3),
+            sampling=detector.maximum_sampling(30e3),
         ).scan()
         assert patterns.metadata["antialias_loss_max"] < 0.05
 
@@ -1127,3 +1133,63 @@ class TestFFTFriendlyGpts:
         assert builder.potential_gpts == fft_friendly_gpts(
             (10.0, 10.0), builder.sampling
         )
+
+
+class TestSamplingEstimators:
+    @pytest.fixture
+    def silicon(self):
+        return ase.build.bulk("Si", "diamond", a=5.431)
+
+    def test_resolving_the_atoms_is_the_stricter_condition(self, silicon):
+        # For a typical EBSD geometry the grid that carries the collected
+        # angles is far too coarse to resolve the potential producing them.
+        angular = maximum_sampling(30e3, patch_half_angle(400))
+        atomic = potential_sampling(silicon)
+        assert atomic < angular
+        assert recommended_sampling(
+            30e3, patch_half_angle(400), atoms=silicon
+        ) == pytest.approx(atomic)
+
+    def test_falls_back_to_the_angular_bound_without_atoms(self):
+        angle = patch_half_angle(400)
+        assert recommended_sampling(30e3, angle) == pytest.approx(
+            maximum_sampling(30e3, angle)
+        )
+
+    def test_heavier_atoms_need_finer_sampling(self):
+        # A heavier nucleus has a more compact potential, so its transform
+        # reaches further and the grid has to be finer.
+        samplings = [
+            potential_sampling(ase.Atoms(s, positions=[(0, 0, 0)], cell=(4, 4, 4)))
+            for s in ("C", "Si", "Cu", "Au")
+        ]
+        assert samplings == sorted(samplings, reverse=True)
+
+    def test_a_tighter_tolerance_asks_for_finer_sampling(self, silicon):
+        assert potential_sampling(silicon, tolerance=0.001) < potential_sampling(
+            silicon, tolerance=0.01
+        )
+
+    def test_matches_the_silicon_convergence_measurement(self, silicon):
+        # Measured against a far finer grid, silicon at 30 kV runs about 0.6%
+        # off at 0.07 A and 5% off at 0.10 A, so a 1% target should land
+        # between them.
+        assert 0.05 < potential_sampling(silicon, tolerance=0.01) < 0.10
+
+    @pytest.mark.parametrize("tolerance", [0.0, 1.0, -0.1])
+    def test_rejects_an_impossible_tolerance(self, silicon, tolerance):
+        with pytest.raises(ValueError, match="tolerance must be between"):
+            potential_sampling(silicon, tolerance=tolerance)
+
+    def test_rejects_an_empty_cell(self):
+        with pytest.raises(ValueError, match="empty cell"):
+            potential_sampling(ase.Atoms(cell=(4, 4, 4)))
+
+    def test_the_builder_defaults_to_the_finer_condition(self, silicon):
+        builder = EBSDReferencePattern(
+            silicon,
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=400,
+        )
+        assert builder.sampling == pytest.approx(potential_sampling(silicon))
+        assert builder.sampling < maximum_sampling(30e3, builder.max_angle)
