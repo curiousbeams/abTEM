@@ -2428,6 +2428,7 @@ class EBSDReciprocitySMatrix(SMatrix):
         pbar: bool = None,
         multiply_potential: bool = True,
         coherent: bool = False,
+        normalise: bool = True,
     ):
         """
         Build the plane waves of the scattering matrix and propagate them through the
@@ -2495,7 +2496,7 @@ class EBSDReciprocitySMatrix(SMatrix):
 
                     # Initialize reciprocity plane waves propagating downwards
                     array = plane_waves(wave_vectors, s_matrix.extent, s_matrix.gpts)
-                    array *= np.prod(s_matrix.interpolation) * np.sqrt(np.prod(array.shape[-2:]))
+                    array *= np.prod(s_matrix.interpolation) 
 
                     initial_fft_amplitude = xp.sum(xp.abs(xp.fft.fft2(array, axes=(-2, -1)))**2, axis=(-2, -1))
 
@@ -2535,8 +2536,11 @@ class EBSDReciprocitySMatrix(SMatrix):
                             if coherent:
                                 if multiply_potential:
                                     # rutherford_screen and alpha remain the same as they are based on intensity/potential scaling
-                                    rutherford_screen = xp.abs(potential.array[ep_index]) ** 2 
-                                    alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2) / xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * rutherford_screen))
+                                    rutherford_screen = xp.abs(potential.array[ep_index]) ** 2 * sigma ** 2
+                                    if normalise:
+                                        alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2) / xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * rutherford_screen))
+                                    else:
+                                        alpha = 1
                                     potential_mask = rutherford_screen * alpha**2
                                     
                                     # For coherent superposition, apply the amplitude mask (sqrt of intensity mask) 
@@ -2544,22 +2548,27 @@ class EBSDReciprocitySMatrix(SMatrix):
                                     complex_source = source.array[ep_index+1] * xp.sqrt(potential_mask)
                                 else:
                                     complex_source = source.array[ep_index+1]
-                                intensities[start:stop] += xp.sum(complex_source * waves.array, axis=(-2, -1))/num_slices
+                                intensities[start:stop] += xp.sum(complex_source * waves.array, axis=(-2, -1))/num_slices 
                             else:
                                 if multiply_potential:
                                     # sigma = energy2sigma(self.energy)
-                                    potential_mask = xp.abs(potential.array[ep_index]) ** 2 
-
-                                    alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2)/xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * potential_mask))
+                                    potential_mask = xp.abs(potential.array[ep_index]) ** 2 * sigma ** 2
+                                    if normalise:
+                                        alpha = xp.sqrt(xp.mean(xp.abs(source.array[ep_index+1]) ** 2)/xp.mean(xp.abs(source.array[ep_index+1]) ** 2 * potential_mask))
+                                    else:
+                                        alpha = 1
                                     potential_mask = potential_mask * alpha**2
                                     source_intensity = xp.abs(source.array[ep_index+1]) ** 2 * potential_mask
                                 else:
                                     source_intensity = xp.abs(source.array[ep_index+1]) ** 2
                                     
                                 # Integrate over real space (summing over axes -2 and -1)
-                                overlap = xp.sum(wave_intensity * source_intensity, axis=(-2, -1))
-                                
-                                intensities[start:stop] += overlap/num_slices
+                                overlap = xp.sum(wave_intensity * source_intensity, axis=(-2, -1)) * potential.sampling[0] * potential.sampling[1]
+
+                                if normalise:
+                                    intensities[start:stop] += overlap/num_slices* np.sqrt(np.prod(array.shape[-2:]))
+                                else:
+                                    intensities[start:stop] += overlap
 
                     pbar.update_if_exists(stop - start)
                     
@@ -2624,14 +2633,15 @@ class EBSDReciprocitySMatrix(SMatrix):
                 num_probes = source.shape[1]
                 
             xp = get_array_module(self._device)
-    
-            slice_thickness = potential.slice_thickness[0]
-    
-            s_ep, _, s_n, s_m = source.shape
+
+            s_ep, *_, s_n, s_m = source.shape
             if s_ep != num_exit_planes:
                 raise ValueError(f"Source exit planes ({s_ep}) do not match potential exit planes ({num_exit_planes}).")
     
-            intensities = xp.zeros((num_probes, len(self)), dtype=xp.float32)
+            probe_shape = source.shape[1:-2]
+
+            # Unpack probe_shape dynamically into the initialization tuple
+            intensities = xp.zeros((*probe_shape, len(self)), dtype=xp.float32)
     
             AA_losses = xp.zeros(len(self), dtype=xp.float32)
     
@@ -2681,20 +2691,28 @@ class EBSDReciprocitySMatrix(SMatrix):
                 
                             # 5. Compute the incoherent overlap integral via Reciprocity
                             if ep_index is not None:
-                                # Intensity of the downward propagating backscatter wave: shape (Batch, N, M)
+                                # Intensity of the downward propagating backscatter wave: shape (B, x, y)
                                 wave_intensity = xp.abs(waves.array) ** 2
-                                
-                                # Intensity of the incident beam at this depth: shape (N, M)
-                                for probe in range(num_probes):
-                                    if multiply_potential:
-                                        source_intensity = xp.abs(source.array[ep_index+1, probe]) ** 2 * potential.array[ep_index] ** 2
-                                    else:
-                                        source_intensity = xp.abs(source.array[ep_index+1, probe]) ** 2
-                                         
-                                    # Integrate over real space (summing over axes -2 and -1)
-                                    overlap = xp.sum(wave_intensity * source_intensity, axis=(-2, -1))
-                                    
-                                    intensities[probe, start:stop] += overlap/num_slices
+
+                                # Incident beam slice at this depth: shape (X, Y, x, y)
+                                probe_slice = source.array[ep_index + 1]
+
+                                if multiply_potential:
+                                    source_intensity = (xp.abs(probe_slice) ** 2) * (potential.array[ep_index] ** 2)
+                                else:
+                                    source_intensity = xp.abs(probe_slice) ** 2
+
+                                # Nested loop over probe positions X and Y
+                                for i in range(probe_shape[0]):
+                                    for j in range(probe_shape[1]):
+                                        # Extract a single 2D probe spatial slice: shape (x, y) -> (1, x, y)
+                                        single_source = source_intensity[i, j][None, :, :]
+
+                                        # Multiply (1, x, y) with (B, x, y) and sum over spatial axes -> shape (B,)
+                                        overlap = xp.sum(single_source * wave_intensity, axis=(-2, -1))
+
+                                        # Accumulate directly into the output array for this probe position
+                                        intensities[i, j, start:stop] += overlap / num_slices
 
                         pbar.update_if_exists(stop - start)
                         
