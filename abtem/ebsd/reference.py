@@ -311,9 +311,18 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         the default density of the sampled directions; the projection itself
         happens in :meth:`SphericalPattern.project`.
     projection : str or HemisphereProjection, optional
-        Projection whose even grid the directions are drawn from, so that the
-        image binned in that same projection has no gaps. One of
-        ``'stereographic'`` (default) or ``'lambert'``.
+        Projection whose even grid the directions are drawn from. One of
+        ``'lambert'`` (default) or ``'stereographic'``.
+
+        Lambert is the better choice and the default for two reasons. It is
+        equal-area, so it samples the hemisphere uniformly: a stereographic
+        grid puts three times more directions per steradian at the equator than
+        at the pole, which is the wrong way round, since the poles carry the
+        zone-axis detail. And it covers the whole hemisphere including the
+        near-equator azimuths that fall in the corners of its square, which a
+        stereographic disk never reaches -- so a Lambert-sampled pattern can be
+        interpolated to either projection without gaps, while the reverse
+        leaves holes.
     sampling : float, optional
         Real-space sampling of the potential [Å]. Defaults to
         :func:`recommended_sampling`, which is the finer of what the patch
@@ -378,7 +387,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         n_patches: int = 400,
         slab_cell: tuple[float, float, float] = (10.0, 10.0, 40.0),
         gpts: int = 128,
-        projection: str | HemisphereProjection = "stereographic",
+        projection: str | HemisphereProjection = "lambert",
         sampling: Optional[float] = None,
         slice_thickness: float = 1.0,
         direction_gpts: Optional[int] = None,

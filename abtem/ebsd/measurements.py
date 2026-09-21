@@ -163,6 +163,77 @@ class SphericalPattern(CopyMixin, EqualityMixin):
     def __len__(self) -> int:
         return len(self._directions)
 
+    def interpolate_directions(self, directions: np.ndarray) -> np.ndarray:
+        """Evaluate the pattern at arbitrary directions.
+
+        The primitive the grid interpolations are built on, and what a detector
+        needs: the rays of a flat screen are a gnomonic projection of the
+        sphere, so they land nowhere near any square grid.
+
+        Interpolation is carried out in the square Lambert plane. Being
+        equal-area, it distorts the neighbourhoods least, and it covers the
+        whole hemisphere, so a pattern sampled there has no target outside it.
+
+        Parameters
+        ----------
+        directions : np.ndarray
+            Unit vectors of shape ``(M, 3)``. Those in the southern hemisphere
+            are evaluated at their mirror image, which is correct for a
+            centrosymmetric crystal and wrong otherwise.
+
+        Returns
+        -------
+        values : np.ndarray
+            Array of shape ``self.ensemble_shape + (M,)``.
+        """
+        from scipy.interpolate import griddata  # type: ignore[import-untyped]
+
+        if self.is_lazy:
+            raise RuntimeError(
+                "compute() the pattern before interpolating it; the "
+                "interpolation is not built as a dask graph"
+            )
+
+        directions = np.asarray(directions, dtype=float)
+        if directions.ndim != 2 or directions.shape[1] != 3:
+            raise ValueError(
+                f"directions must have shape (M, 3), got {directions.shape}"
+            )
+
+        lambert = validate_projection("lambert")
+
+        northern = self._directions[:, 2] >= 0.0
+        source = lambert.project(self._directions[northern])
+
+        target = lambert.project(
+            np.where(directions[:, 2:3] >= 0.0, directions, -directions)
+        )
+
+        flat = self._array.reshape(-1, len(self._directions))[:, northern]
+
+        values = np.empty((len(flat), len(directions)))
+        fraction_filled = 0.0
+        for i, sampled in enumerate(flat):
+            interpolated = griddata(source, sampled, target, method="linear")
+            missing = np.isnan(interpolated)
+            if missing.any():
+                fraction_filled = max(fraction_filled, float(missing.mean()))
+                interpolated[missing] = griddata(
+                    source, sampled, target[missing], method="nearest"
+                )
+            values[i] = interpolated
+
+        if fraction_filled > 0.001:
+            warnings.warn(
+                f"{fraction_filled:.1%} of the requested directions lie outside "
+                f"the sampled ones and were filled from the nearest, which "
+                f"shows up as flat patches. Sample the pattern in the lambert "
+                f"projection, which covers the hemisphere completely.",
+                SparseProjectionWarning,
+            )
+
+        return values.reshape(self.ensemble_shape + (len(directions),))
+
     def interpolate(
         self,
         gpts: int,
@@ -172,8 +243,8 @@ class SphericalPattern(CopyMixin, EqualityMixin):
 
         This differs from :meth:`project`, which *bins* the directions into
         pixels and therefore needs more directions than pixels to avoid holes.
-        Here the value is evaluated *at* each grid node by interpolating the
-        sampled directions, so any grid size is well defined.
+        Here the value is evaluated *at* each grid node, by
+        :meth:`interpolate_directions`, so any grid size is well defined.
 
         Node sampling is what a master pattern file wants, because a consumer
         reading it interpolates between nodes. When the pattern was calculated
@@ -195,49 +266,17 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             Nodes outside the projection's domain -- the corners the
             stereographic disk does not cover -- are zero.
         """
-        from scipy.interpolate import griddata  # type: ignore[import-untyped]
-
         projection = validate_projection(projection)
-
-        if self.is_lazy:
-            raise RuntimeError(
-                "compute() the pattern before interpolating it; the "
-                "interpolation is not built as a dask graph"
-            )
-
-        northern = self._directions[:, 2] >= 0.0
-        source = projection.project(self._directions[northern])
 
         nodes = np.linspace(-1.0, 1.0, gpts)
         x, y = np.meshgrid(nodes, nodes, indexing="ij")
-        target = np.stack([x.ravel(), y.ravel()], axis=1)
-        inside = projection.domain_mask(target)
+        square = np.stack([x.ravel(), y.ravel()], axis=1)
+        inside = projection.domain_mask(square)
 
-        flat = self._array.reshape(-1, len(self._directions))[:, northern]
+        values = self.interpolate_directions(projection.unproject(square[inside]))
 
-        images = np.zeros((len(flat), gpts * gpts))
-        fraction_filled = 0.0
-        for i, values in enumerate(flat):
-            interpolated = griddata(source, values, target[inside], method="linear")
-            # Nodes beyond the convex hull of the sampled directions come back
-            # as NaN; fall back to the nearest sample rather than a hole.
-            missing = np.isnan(interpolated)
-            if missing.any():
-                fraction_filled = max(fraction_filled, float(missing.mean()))
-                interpolated[missing] = griddata(
-                    source, values, target[inside][missing], method="nearest"
-                )
-            images[i, inside] = interpolated
-
-        if fraction_filled > 0.001:
-            warnings.warn(
-                f"{fraction_filled:.1%} of the nodes lie outside the sampled "
-                f"directions and were filled from the nearest one, which shows "
-                f"up as flat patches near the edges. Sample the pattern in the "
-                f"{projection.name} projection to cover the grid exactly.",
-                SparseProjectionWarning,
-            )
-
+        images = np.zeros(self.ensemble_shape + (gpts * gpts,))
+        images[..., inside] = values
         images = images.reshape(self.ensemble_shape + (gpts, gpts))
 
         return ReferencePatternImages(
@@ -327,18 +366,25 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         projection: str | HemisphereProjection = "stereographic",
         **kwargs,
     ):
-        """Project the pattern and show it.
+        """Interpolate the pattern onto a square image and show it.
+
+        Uses :meth:`interpolate` rather than :meth:`project`, so the image is
+        filled whichever projection is asked for. Binning would leave holes
+        wherever the sampled directions do not reach the requested grid --
+        showing a Lambert-sampled pattern stereographically that way empties
+        more than half the pixels.
 
         Parameters
         ----------
         gpts : int, optional
             Number of pixels along each axis of the image shown (default 256).
         projection : str or HemisphereProjection, optional
-            One of ``'stereographic'`` (default) or ``'lambert'``.
+            One of ``'stereographic'`` (default, the familiar view) or
+            ``'lambert'``.
         kwargs :
             Passed to :meth:`abtem.measurements.Images.show`.
         """
-        return self.project(gpts, projection).show(**kwargs)
+        return self.interpolate(gpts, projection).show(**kwargs)
 
     def to_zarr(self, url: str, overwrite: bool = False) -> None:
         """Write the pattern to a zarr store.

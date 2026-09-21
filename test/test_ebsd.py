@@ -760,7 +760,7 @@ class TestEBSDReferencePattern:
         assert metadata["n_patches"] == 1
         assert metadata["max_angle"] == pytest.approx(200.0)
         assert metadata["energy"] == 30e3
-        assert metadata["projection"] == "stereographic"
+        assert metadata["projection"] == "lambert"
 
     def test_compute_projects_to_an_image(self, builder):
         # One patch covers a cap, not the hemisphere, so most of the image is
@@ -1550,3 +1550,120 @@ class TestProbePositionAveraging:
     def test_rejects_a_bad_count(self):
         with pytest.raises(ValueError, match="probe_positions must be at least 1"):
             self.builder(probe_positions=0)
+
+
+class TestInterpolateDirections:
+    @staticmethod
+    def analytic(directions):
+        return (
+            1.0
+            + 0.4 * directions[:, 2] ** 2
+            + 0.25 * directions[:, 0] * directions[:, 1]
+        )
+
+    @pytest.fixture
+    def pattern(self):
+        directions = SquareLambertProjection().grid(101)
+        return SphericalPattern(self.analytic(directions), directions)
+
+    def test_exact_at_the_sampled_directions(self, pattern):
+        got = pattern.interpolate_directions(pattern.directions)
+        assert np.allclose(got, self.analytic(pattern.directions), atol=1e-12)
+
+    def test_accurate_between_them(self, pattern):
+        rng = np.random.default_rng(0)
+        q = rng.normal(size=(2000, 3))
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        q[:, 2] = np.abs(q[:, 2])
+        error = np.abs(pattern.interpolate_directions(q) - self.analytic(q))
+        assert error.mean() < 1e-3
+
+    def test_handles_gnomonic_rays(self, pattern):
+        # A flat detector's rays are a gnomonic projection of the sphere, so
+        # they land on no square grid; this is what makes them workable.
+        n, spacing, distance = 32, 50.0, 15000.0
+        axis = (np.arange(n) - n // 2) * spacing
+        x, y = np.meshgrid(axis, axis, indexing="ij")
+        rays = np.stack([x.ravel(), y.ravel(), np.full(x.size, distance)], axis=1)
+        rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+
+        patch = pattern.interpolate_directions(rays).reshape(n, n)
+        assert patch.shape == (n, n)
+        assert np.allclose(patch.ravel(), self.analytic(rays), atol=1e-2)
+
+    def test_southern_directions_use_the_mirror(self, pattern):
+        northern = np.array([[0.3, 0.4, np.sqrt(1 - 0.25)]])
+        assert np.allclose(
+            pattern.interpolate_directions(northern),
+            pattern.interpolate_directions(-northern),
+        )
+
+    def test_preserves_the_ensemble(self):
+        directions = SquareLambertProjection().grid(61)
+        values = self.analytic(directions)
+        pattern = SphericalPattern(
+            np.stack([values, 2 * values]),
+            directions,
+            ensemble_axes_metadata=[OrdinalAxis(values=(0, 1))],
+        )
+        got = pattern.interpolate_directions(directions[:50])
+        assert got.shape == (2, 50)
+        assert np.allclose(got[1], 2 * got[0])
+
+    def test_rejects_a_bad_shape(self, pattern):
+        with pytest.raises(ValueError, match=r"shape \(M, 3\)"):
+            pattern.interpolate_directions(np.zeros((4, 2)))
+
+    def test_refuses_a_lazy_pattern(self):
+        atoms = silicon_slab()
+        grid = BackscatterDetector(max_angle=50, gpts=6)
+        lazy = make_ebsd(
+            atoms, BackscatterDetector(directions=grid.directions)
+        ).scan(lazy=True)
+        with pytest.raises(RuntimeError, match=r"compute\(\) the pattern"):
+            lazy.interpolate_directions(grid.directions)
+
+
+class TestSamplingProjectionDefault:
+    def test_defaults_to_lambert(self):
+        builder = EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=400,
+        )
+        assert builder.projection.name == "lambert"
+
+    def test_lambert_samples_solid_angle_uniformly(self):
+        # A stereographic grid puts far more directions per steradian at the
+        # equator than at the pole; an equal-area one does not.
+        edges = np.cos(np.radians([0, 30, 60, 90]))[::-1]
+        spread = {}
+        for name in ("lambert", "stereographic"):
+            z = validate_projection(name).grid(148)[:, 2]
+            counts, _ = np.histogram(z, bins=edges)
+            density = counts / (2 * np.pi * np.diff(edges))
+            spread[name] = density.max() / density.min()
+        assert spread["lambert"] < 1.2
+        assert spread["stereographic"] > 2.0
+
+    def test_lambert_sampling_covers_either_view(self):
+        # The Lambert square reaches the near-equator azimuths a stereographic
+        # disk never does, so it can be interpolated to either projection.
+        directions = validate_projection("lambert").grid(121)
+        pattern = SphericalPattern(1.0 + directions[:, 2], directions)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SparseProjectionWarning)
+            pattern.interpolate(64, "lambert")
+            pattern.interpolate(64, "stereographic")
+
+    def test_show_interpolates_rather_than_bins(self):
+        # Binning a Lambert-sampled pattern into a stereographic image empties
+        # most of it; show must not do that.
+        import matplotlib
+
+        matplotlib.use("Agg")
+        directions = validate_projection("lambert").grid(121)
+        pattern = SphericalPattern(1.0 + directions[:, 2], directions)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SparseProjectionWarning)
+            pattern.show(gpts=64, display=False)
