@@ -2,7 +2,9 @@
 
 from abtem.ebsd.detectors import BackscatterDetector, small_angle_error
 from abtem.ebsd.emsoft import write_emsoft_master_pattern
+from abtem.ebsd.geometry import EBSDGeometry, bunge_rotation
 from abtem.ebsd.measurements import (
+    EBSDPatternImages,
     ReferencePatternImages,
     SparseProjectionWarning,
     SphericalPattern,
@@ -42,6 +44,9 @@ __all__ = [
     "potential_sampling",
     "recommended_sampling",
     "BackscatterDetector",
+    "EBSDGeometry",
+    "EBSDPatternImages",
+    "bunge_rotation",
     "small_angle_error",
     "SphericalPattern",
     "ReferencePatternImages",

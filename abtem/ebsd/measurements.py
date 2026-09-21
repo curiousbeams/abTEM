@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import warnings
-from typing import Optional, Sequence, cast
+from typing import TYPE_CHECKING, Optional, Sequence, cast
 
 import dask.array as da
 import numpy as np
 import zarr
 
-from abtem.core.axes import AxisMetadata, RealSpaceAxis
+from abtem.core.axes import AxisMetadata, OrdinalAxis, RealSpaceAxis
 from abtem.core.utils import CopyMixin, EqualityMixin
 from abtem.ebsd.projections import (
     HemisphereProjection,
@@ -19,7 +19,15 @@ from abtem.ebsd.projections import (
 )
 from abtem.measurements import Images
 
-__all__ = ["ReferencePatternImages", "SphericalPattern", "SparseProjectionWarning"]
+if TYPE_CHECKING:
+    from abtem.ebsd.geometry import EBSDGeometry
+
+__all__ = [
+    "ReferencePatternImages",
+    "EBSDPatternImages",
+    "SphericalPattern",
+    "SparseProjectionWarning",
+]
 
 
 class SparseProjectionWarning(UserWarning):
@@ -42,6 +50,25 @@ class ReferencePatternImages(Images):
             ),
             RealSpaceAxis(
                 label="y", sampling=self.sampling[1], units="", tex_label="$y$"
+            ),
+        ]
+
+
+class EBSDPatternImages(Images):
+    """A pattern projected onto an EBSD detector.
+
+    Identical to :class:`~abtem.measurements.Images` except that the base axes
+    are the detector's own pixels, in micrometres on the scintillator.
+    """
+
+    @property
+    def base_axes_metadata(self) -> list[AxisMetadata]:
+        return [
+            RealSpaceAxis(
+                label="x", sampling=self.sampling[0], units="µm", tex_label="$x$"
+            ),
+            RealSpaceAxis(
+                label="y", sampling=self.sampling[1], units="µm", tex_label="$y$"
             ),
         ]
 
@@ -286,7 +313,7 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             metadata={**self._metadata, "projection": projection.name},
         )
 
-    def project(
+    def bin(
         self,
         gpts: int,
         projection: str | HemisphereProjection = "stereographic",
@@ -294,9 +321,11 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         """Bin the intensities into a square image.
 
         Each pixel is the mean of the directions falling inside it, so the
-        directions have to outnumber the pixels or the image has holes. Use
-        :meth:`interpolate` to evaluate at grid nodes instead, which is what a
-        master pattern file needs.
+        directions have to outnumber the pixels or the image has holes. This is
+        the reduction to reach for when many directions per pixel is exactly
+        what you have and an unbiased average is what you want; otherwise
+        :meth:`interpolate` evaluates at the grid nodes instead and is well
+        defined at any size.
 
         Parameters
         ----------
@@ -359,6 +388,77 @@ class SphericalPattern(CopyMixin, EqualityMixin):
                 f"directions in the projection you mean to view, or lower gpts.",
                 SparseProjectionWarning,
             )
+
+    def project(
+        self,
+        geometry: "EBSDGeometry",
+        euler: np.ndarray | Sequence[float] = (0.0, 0.0, 0.0),
+        degrees: bool = True,
+    ) -> "EBSDPatternImages":
+        """Project the pattern onto an EBSD detector.
+
+        What a detector records is a gnomonic projection of the sphere: each
+        pixel looks along the ray through it, so the pattern is evaluated at
+        those directions after rotating them into the crystal frame by the
+        orientation.
+
+        The result is the diffraction *modulation*, around one. That is what an
+        experimental pattern becomes once its background is divided out, which
+        is how EBSD patterns are prepared for indexing anyway. What it does not
+        carry is the smooth background itself, nor the energy spectrum: both
+        are Monte Carlo products that this calculation does not produce.
+
+        To add shot noise, use the returned measurement's
+        :meth:`~abtem.measurements.Images.poisson_noise`. Note its
+        ``total_dose`` multiplies every pixel, and these values sit near one,
+        so it acts as the counts per pixel of a featureless specimen; divide
+        the result by it to come back to a modulation.
+
+        Parameters
+        ----------
+        geometry : EBSDGeometry
+            Where the detector is.
+        euler : np.ndarray, optional
+            Bunge Euler angles of the crystal, of shape ``(3,)`` or ``(N, 3)``
+            for several orientations at once (default no rotation).
+        degrees : bool, optional
+            If True (default), `euler` is in degrees.
+
+        Returns
+        -------
+        images : EBSDPatternImages
+            Of shape ``geometry.shape``, with leading axes for any orientations
+            and for this pattern's own ensemble.
+        """
+
+        directions = geometry.rotated_directions(
+            np.asarray(euler, dtype=float), degrees=degrees
+        )
+
+        orientation_shape = directions.shape[:-3]
+        rows, columns = geometry.shape
+
+        values = self.interpolate_directions(directions.reshape(-1, 3))
+        values = values.reshape(
+            self.ensemble_shape + orientation_shape + (rows, columns)
+        )
+
+        axes: list[AxisMetadata] = list(self.ensemble_axes_metadata)
+        if orientation_shape:
+            euler_values = np.atleast_2d(np.asarray(euler, dtype=float))
+            axes = axes + [
+                OrdinalAxis(
+                    label="orientation",
+                    values=tuple(tuple(float(a) for a in e) for e in euler_values),
+                )
+            ]
+
+        return EBSDPatternImages(
+            values,
+            sampling=geometry.pixel_size,
+            ensemble_axes_metadata=axes,
+            metadata={**self._metadata, "label": "backscattered intensity"},
+        )
 
     def show(
         self,

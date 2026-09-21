@@ -10,12 +10,15 @@ from abtem.ebsd import (
     EBSD,
     AntialiasLossWarning,
     BackscatterDetector,
+    EBSDGeometry,
+    EBSDPatternImages,
     SparseProjectionWarning,
     SphericalPattern,
     SquareLambertProjection,
     StereographicProjection,
     bin_directions,
     bulk_block,
+    bunge_rotation,
     estimate_repetitions,
     fibonacci_hemisphere,
     pixel_centers,
@@ -367,7 +370,7 @@ class TestSphericalPattern:
         # holes; that is what TestSparseProjection covers, not this.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SparseProjectionWarning)
-            images = pattern.project(32)
+            images = pattern.bin(32)
         assert images.array.shape == (32, 32)
         assert [axis.units for axis in images.base_axes_metadata] == ["", ""]
         assert images.metadata["projection"] == "stereographic"
@@ -380,7 +383,7 @@ class TestSphericalPattern:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SparseProjectionWarning)
-            images = pattern.project(16)
+            images = pattern.bin(16)
         assert images.array.shape == (2, 16, 16)
         assert images.array[1].max() == pytest.approx(2.0)
 
@@ -767,7 +770,7 @@ class TestEBSDReferencePattern:
         # empty by construction.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SparseProjectionWarning)
-            images = builder.build(pbar=False).project(8)
+            images = builder.build(pbar=False).bin(8)
         assert images.array.shape == (8, 8)
         assert np.all(np.isfinite(images.array))
 
@@ -821,7 +824,7 @@ class TestSparseProjection:
         pattern = self.pattern_sampled_in(projection, gpts=148)
         with warnings.catch_warnings():
             warnings.simplefilter("error", SparseProjectionWarning)
-            pattern.project(128, projection)
+            pattern.bin(128, projection)
 
     @pytest.mark.parametrize(
         "sampled, viewed",
@@ -832,22 +835,22 @@ class TestSparseProjection:
         # through the wrong one leaves a moire of empty pixels.
         pattern = self.pattern_sampled_in(sampled, gpts=148)
         with pytest.warns(SparseProjectionWarning, match="no sampled direction"):
-            pattern.project(128, viewed)
+            pattern.bin(128, viewed)
 
     def test_too_many_pixels_warns(self):
         pattern = self.pattern_sampled_in("lambert", gpts=32)
         with pytest.warns(SparseProjectionWarning):
-            pattern.project(256, "lambert")
+            pattern.bin(256, "lambert")
 
     def test_stereographic_corners_do_not_count_as_holes(self):
         # The corners outside the disk are legitimately empty; only pixels
         # inside the projection's domain are holes.
         pattern = self.pattern_sampled_in("stereographic", gpts=148)
-        image = pattern.project(128, "stereographic")
+        image = pattern.bin(128, "stereographic")
         assert np.count_nonzero(image.array) < 128**2
         with warnings.catch_warnings():
             warnings.simplefilter("error", SparseProjectionWarning)
-            pattern.project(128, "stereographic")
+            pattern.bin(128, "stereographic")
 
 
 class TestPixelCenters:
@@ -1347,7 +1350,7 @@ class TestLazy:
         detector = BackscatterDetector(directions=grid.directions)
         lazy = make_ebsd(atoms, detector).scan(lazy=True)
         with pytest.raises(RuntimeError, match="compute\\(\\) the pattern"):
-            lazy.project(8)
+            lazy.bin(8)
 
 
 class TestReferencePatternLazy:
@@ -1667,3 +1670,172 @@ class TestSamplingProjectionDefault:
         with warnings.catch_warnings():
             warnings.simplefilter("error", SparseProjectionWarning)
             pattern.show(gpts=64, display=False)
+
+
+class TestBungeRotation:
+    def test_identity_at_zero(self):
+        assert np.allclose(bunge_rotation((0.0, 0.0, 0.0)), np.eye(3))
+
+    @pytest.mark.parametrize(
+        "euler", [(0, 0, 0), (30, 54.7, 45), (110, 35, 20), (200, 80, 300)]
+    )
+    def test_is_a_proper_rotation(self, euler):
+        g = bunge_rotation(euler)
+        assert np.allclose(g @ g.T, np.eye(3))
+        assert np.linalg.det(g) == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("euler", [(30, 54.7, 45), (110, 35, 20)])
+    def test_matches_abtem_euler_to_rotation(self, euler):
+        # Pins the documented equivalence, which involves both a transpose and
+        # an angle order; getting either backwards mirrors every pattern.
+        from abtem.atoms import euler_to_rotation
+
+        expected = euler_to_rotation(
+            *np.radians(euler), axes="zxz", convention="extrinsic"
+        ).T
+        assert np.allclose(bunge_rotation(euler), expected)
+
+    def test_degrees_flag(self):
+        assert np.allclose(
+            bunge_rotation((30, 45, 60)),
+            bunge_rotation(np.radians([30, 45, 60]), degrees=False),
+        )
+
+    def test_stacks(self):
+        stacked = bunge_rotation([[0, 0, 0], [30, 45, 60]])
+        assert stacked.shape == (2, 3, 3)
+        assert np.allclose(stacked[1], bunge_rotation((30, 45, 60)))
+
+    def test_rejects_a_bad_shape(self):
+        with pytest.raises(ValueError, match=r"shape \(3,\) or \(N, 3\)"):
+            bunge_rotation(np.zeros(4))
+
+
+class TestEBSDGeometry:
+    # Direction cosines from kikuchipy's _get_direction_cosines_for_fixed_pc,
+    # which is validated against EMsoft. Pinned here so the convention cannot
+    # drift without kikuchipy being a test dependency.
+    KIKUCHIPY = np.array(
+        [
+            [
+                [0.411739949235, -0.150712623042, 0.898752423896],
+                [0.411949717925, -0.147416940529, 0.899202800010],
+                [0.412154921799, -0.144119437244, 0.899643211638],
+                [0.412355553407, -0.140820222859, 0.900073642769],
+            ],
+            [
+                [0.414767614101, -0.150715134529, 0.897358776921],
+                [0.414977487428, -0.147419397260, 0.897809114589],
+                [0.415182762154, -0.144121839127, 0.898249502920],
+                [0.415383430825, -0.140822569810, 0.898679925907],
+            ],
+            [
+                [0.417790738425, -0.150715971719, 0.895955129878],
+                [0.418000713757, -0.147420216198, 0.896405423430],
+                [0.418206056856, -0.144122639782, 0.896845783126],
+                [0.418406760259, -0.140823352153, 0.897276192963],
+            ],
+        ]
+    )
+
+    def test_matches_kikuchipy(self):
+        geometry = EBSDGeometry(
+            shape=(3, 4),
+            detector_distance=15000.0,
+            pattern_center=(2.0, -1.0),
+            pixel_size=50.0,
+            sample_tilt=70.0,
+            camera_tilt=5.0,
+            azimuthal_angle=8.0,
+        )
+        assert np.allclose(geometry.directions, self.KIKUCHIPY, atol=1e-11)
+
+    def test_directions_are_unit_vectors(self):
+        directions = EBSDGeometry(shape=(20, 30)).directions
+        assert directions.shape == (20, 30, 3)
+        assert np.allclose(np.linalg.norm(directions, axis=-1), 1.0)
+
+    def test_the_pattern_centre_looks_along_the_tilted_normal(self):
+        # With the pattern centre on axis, the middle of the detector looks
+        # back along the sample normal tilted by sample_tilt.
+        geometry = EBSDGeometry(shape=(101, 101), sample_tilt=70.0, camera_tilt=0.0)
+        centre = geometry.directions[50, 50]
+        assert centre[0] == pytest.approx(np.cos(np.radians(70.0)), abs=1e-6)
+        assert centre[2] == pytest.approx(np.sin(np.radians(70.0)), abs=1e-6)
+
+    def test_detector_to_sample_is_a_rotation(self):
+        geometry = EBSDGeometry(sample_tilt=70.0, azimuthal_angle=12.0)
+        rotation = geometry.detector_to_sample
+        assert np.allclose(rotation @ rotation.T, np.eye(3))
+        assert np.linalg.det(rotation) == pytest.approx(1.0)
+
+    def test_moving_the_pattern_centre_shifts_the_rays(self):
+        a = EBSDGeometry(shape=(20, 20), pattern_center=(0.0, 0.0)).directions
+        b = EBSDGeometry(shape=(20, 20), pattern_center=(3.0, 0.0)).directions
+        assert not np.allclose(a, b)
+
+    @pytest.mark.parametrize(
+        "kwargs, match",
+        [
+            ({"shape": (0, 4)}, "shape must be positive"),
+            ({"detector_distance": -1.0}, "detector_distance must be positive"),
+            ({"pixel_size": 0.0}, "pixel_size must be positive"),
+        ],
+    )
+    def test_rejects_bad_geometry(self, kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            EBSDGeometry(**kwargs)
+
+
+class TestDetectorProjection:
+    @pytest.fixture
+    def pattern(self):
+        directions = SquareLambertProjection().grid(201)
+        values = 1.0 + 0.5 * directions[:, 2] ** 2 + 0.35 * directions[:, 0]
+        return SphericalPattern(values, directions, metadata={"energy": 30e3})
+
+    def test_shape_and_units(self, pattern):
+        geometry = EBSDGeometry(shape=(30, 40), pixel_size=50.0)
+        patch = pattern.project(geometry)
+        assert isinstance(patch, EBSDPatternImages)
+        assert patch.array.shape == (30, 40)
+        assert [axis.units for axis in patch.base_axes_metadata] == ["µm", "µm"]
+        assert patch.sampling == (50.0, 50.0)
+
+    def test_matches_a_direct_lookup(self, pattern):
+        # project is the geometry plus interpolate_directions, nothing else.
+        geometry = EBSDGeometry(shape=(12, 16))
+        euler = (30.0, 54.7, 45.0)
+        direct = pattern.interpolate_directions(
+            geometry.rotated_directions(euler).reshape(-1, 3)
+        ).reshape(12, 16)
+        assert np.allclose(np.asarray(pattern.project(geometry, euler).array), direct)
+
+    def test_orientation_changes_the_patch(self, pattern):
+        geometry = EBSDGeometry(shape=(16, 16))
+        a = np.asarray(pattern.project(geometry, (0.0, 0.0, 0.0)).array)
+        b = np.asarray(pattern.project(geometry, (30.0, 54.7, 45.0)).array)
+        assert not np.allclose(a, b)
+
+    def test_several_orientations_at_once(self, pattern):
+        geometry = EBSDGeometry(shape=(10, 12))
+        euler = [[0.0, 0.0, 0.0], [30.0, 54.7, 45.0], [110.0, 35.0, 20.0]]
+        patches = pattern.project(geometry, euler)
+        assert patches.array.shape == (3, 10, 12)
+        for i, e in enumerate(euler):
+            one = pattern.project(geometry, e)
+            assert np.allclose(patches.array[i], one.array)
+
+    def test_values_are_a_modulation_about_one(self, pattern):
+        patch = np.asarray(pattern.project(EBSDGeometry(shape=(20, 20))).array)
+        assert 0.5 < patch.mean() < 2.0
+
+    def test_poisson_noise_applies_to_the_patch(self, pattern):
+        # The detector patch is where shot noise belongs; total_dose multiplies
+        # every pixel, and these sit near one, so it is the counts per pixel of
+        # a featureless specimen.
+        patch = pattern.project(EBSDGeometry(shape=(24, 24)))
+        noisy = patch.poisson_noise(total_dose=400, seed=1)
+        recovered = np.asarray(noisy.array) / 400
+        assert np.abs(recovered.mean() - np.asarray(patch.array).mean()) < 0.05
+        assert recovered.std() > np.asarray(patch.array).std()

@@ -257,7 +257,16 @@ def write_emsoft_master_pattern(
     # EMsoft's Rosca-Lambert square is exactly abTEM's SquareLambertProjection,
     # up to the edge length of the square, so this is a resampling and not a
     # change of projection.
-    northern = np.asarray(pattern.interpolate(2 * npx + 1, "lambert").array)
+    #
+    # It is stored transposed, though. EMsoft swaps the two Lambert
+    # coordinates when it looks a direction up (`ixy(1), ixy(2) = ixy(2),
+    # -ixy(1)` in CalcEBSDPatternSingleFull) and writes the array in Fortran
+    # order besides, which together amount to a transpose of the projection
+    # here. Writing it unchanged produces a file that loads, looks like a
+    # plausible Kikuchi pattern, and indexes to the wrong orientation --
+    # verified against kikuchipy, which reproduces this module's own detector
+    # projection only once the stored array is transposed.
+    northern = np.asarray(pattern.interpolate(2 * npx + 1, "lambert").array).T
     # I(-k) = I(k) is a 180 degree rotation of the Lambert square, since the
     # projection is odd in the in-plane coordinates at fixed z.
     southern = northern[::-1, ::-1]
@@ -270,7 +279,7 @@ def write_emsoft_master_pattern(
         warnings.simplefilter("ignore", SparseProjectionWarning)
         stereographic_n = np.asarray(
             pattern.interpolate(2 * npx + 1, "stereographic").array
-        )
+        ).T
     stereographic_s = stereographic_n[::-1, ::-1]
 
     if np.any(northern < 0.0):
