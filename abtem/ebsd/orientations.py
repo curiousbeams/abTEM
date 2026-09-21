@@ -196,6 +196,7 @@ def rotated_slab(
     zone_axis: np.ndarray,
     cell: tuple[float, float, float],
     repetitions: tuple[int, int, int] | None = None,
+    origin: np.ndarray | None = None,
 ) -> tuple[Atoms, np.ndarray]:
     """Cut an orthogonal slab with the given zone axis along ``z``.
 
@@ -223,10 +224,23 @@ def rotated_slab(
         :func:`bulk_block`, which is how to avoid rebuilding it for every zone
         axis.
 
-        The slab is cut around the *centre* of the block, so the repetitions
-        also fix which point of the crystal ends up at the centre of the slab.
-        Changing them therefore shifts the origin of the cut, which changes the
-        result even when the block was already large enough.
+        The slab is cut around `origin`, which defaults to the centre of the
+        block, so the repetitions also fix which point of the crystal ends up
+        at the centre of the slab. Changing them therefore shifts the cut,
+        which changes the result even when the block was already large enough.
+
+        Repeating a cell that contains a defect makes a periodic array of it.
+        For an atomic model that already holds the feature of interest -- an MD
+        cell, say -- pass ``(1, 1, 1)``, or check that
+        :func:`estimate_repetitions` returns it.
+    origin : np.ndarray, optional
+        Point of `atoms`, in Cartesian coordinates, to place at the centre of
+        the slab and to rotate about. Defaults to the centroid of the block.
+
+        Give it to anchor the cut on a feature: a dislocation core, an
+        interface. The centroid is only the feature's position when the atoms
+        happen to be distributed symmetrically about it, which a void, a
+        surface or an off-centre defect all break.
 
     Returns
     -------
@@ -252,12 +266,23 @@ def rotated_slab(
     else:
         block = bulk_block(atoms, cell, repetitions)
 
+    if origin is None:
+        anchor = np.mean(block.positions, axis=0)
+    else:
+        anchor = np.asarray(origin, dtype=float).ravel()
+        if anchor.shape != (3,):
+            raise ValueError(f"origin must have shape (3,), got {anchor.shape}")
+
     # ASE's own rotation is used rather than `rotation` so that the cut is
     # reproducible against code that calls Atoms.rotate directly; the two agree
     # to floating-point precision (see test_zone_axis_rotation_matches_ase).
-    block.rotate(zone_axis / np.linalg.norm(zone_axis), "z", rotate_cell=True)
+    # Rotating about the anchor keeps it fixed, so a feature placed there stays
+    # at the centre of the slab whatever the zone axis.
+    block.rotate(
+        zone_axis / np.linalg.norm(zone_axis), "z", center=anchor, rotate_cell=True
+    )
 
-    positions = block.positions - np.mean(block.positions, axis=0)
+    positions = block.positions - anchor
     half = cell_array / 2.0
 
     inside = np.logical_and.reduce(

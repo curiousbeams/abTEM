@@ -1373,3 +1373,180 @@ class TestReferencePatternLazy:
     def test_the_antialias_loss_is_absent_when_lazy(self, builder):
         assert "antialias_loss_max" in builder.build(pbar=False, lazy=False).metadata
         assert "antialias_loss_max" not in builder.build(lazy=True).metadata
+
+
+class TestSlabOrigin:
+    @pytest.fixture
+    def marked(self):
+        """A block with one tagged site well away from the centroid."""
+        block = ase.build.bulk("Si", "diamond", a=5.431, cubic=True) * (9, 9, 9)
+        target = np.array([12.0, 30.0, 20.0])
+        atoms = block.copy()
+        atoms += ase.Atom("Au", position=target)
+        return atoms, target
+
+    @pytest.mark.parametrize("zone_axis", [(0, 0, 1), (1, 1, 1), (2, 2, 3)])
+    def test_anchors_a_feature_at_the_slab_centre(self, marked, zone_axis):
+        atoms, target = marked
+        cell = (14.0, 14.0, 14.0)
+        slab, _ = rotated_slab(
+            atoms,
+            np.array(zone_axis, dtype=float),
+            cell,
+            repetitions=(1, 1, 1),
+            origin=target,
+        )
+        gold = [a for a in slab if a.symbol == "Au"]
+        assert len(gold) == 1
+        assert np.allclose(gold[0].position, np.array(cell) / 2, atol=1e-6)
+
+    def test_without_an_origin_the_feature_is_not_tracked(self, marked):
+        # The default anchor is the centroid, which an off-centre feature
+        # misses; this is what `origin` exists to fix.
+        atoms, _ = marked
+        slab, _ = rotated_slab(
+            atoms, np.array([1.0, 1.0, 1.0]), (14.0, 14.0, 14.0), repetitions=(1, 1, 1)
+        )
+        assert not [a for a in slab if a.symbol == "Au"]
+
+    def test_the_rotation_maps_any_offset_into_the_slab(self, marked):
+        # The returned matrix is the exact transform, so a feature anywhere can
+        # be located in the cut.
+        atoms, target = marked
+        cell = np.array([14.0, 14.0, 14.0])
+        offset = np.array([3.0, -2.0, 1.0])
+
+        moved = atoms.copy()
+        moved[-1].position = target + offset
+        slab, rotation = rotated_slab(
+            moved, np.array([1.0, 1.0, 1.0]), tuple(cell), repetitions=(1, 1, 1),
+            origin=target,
+        )
+        gold = [a for a in slab if a.symbol == "Au"][0]
+        assert np.allclose(gold.position, rotation @ offset + cell / 2, atol=1e-6)
+
+    def test_the_default_anchor_is_the_centroid(self):
+        atoms = ase.build.bulk("Si", "diamond", a=5.431) * (12, 12, 12)
+        cell = (10.0, 10.0, 10.0)
+        zone_axis = np.array([1.0, 2.0, 3.0])
+        default, _ = rotated_slab(atoms, zone_axis, cell, repetitions=(1, 1, 1))
+        explicit, _ = rotated_slab(
+            atoms, zone_axis, cell, repetitions=(1, 1, 1),
+            origin=atoms.positions.mean(axis=0),
+        )
+        assert len(default) == len(explicit)
+        assert np.allclose(default.positions, explicit.positions, atol=1e-9)
+
+    def test_rejects_a_bad_origin(self):
+        with pytest.raises(ValueError, match=r"origin must have shape \(3,\)"):
+            rotated_slab(
+                ase.build.bulk("Si", "diamond", a=5.431),
+                np.array([0.0, 0.0, 1.0]),
+                (10.0, 10.0, 10.0),
+                origin=np.zeros(2),
+            )
+
+
+class TestProbePositionAveraging:
+    @staticmethod
+    def builder(**kwargs):
+        return EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=1,
+            slab_cell=(6.0, 6.0, 4.0),
+            gpts=8,
+            direction_gpts=30,
+            max_angle=200.0,
+            **kwargs,
+        )
+
+    def test_one_position_means_no_scan(self):
+        assert self.builder().probe_scan is None
+
+    def test_grid_is_square_and_centred_on_the_slab(self):
+        scan = self.builder(probe_positions=3, probe_extent=3.0).probe_scan
+        positions = np.asarray(scan.get_positions())
+        assert len(positions) == 9
+        assert np.allclose(positions.mean(axis=0), [3.0, 3.0], atol=1e-9)
+        assert np.ptp(positions[:, 0]) == pytest.approx(2.0)  # 3 * (3 - 1) / 3
+
+    def test_extent_defaults_to_the_largest_lattice_constant(self):
+        silicon = ase.build.bulk("Si", "diamond", a=5.431)
+        scan = self.builder(probe_positions=2).probe_scan
+        positions = np.asarray(scan.get_positions())
+        expected = float(np.max(silicon.cell.lengths())) / 2
+        assert np.ptp(positions[:, 0]) == pytest.approx(expected)
+
+    def test_one_position_reproduces_the_unaveraged_result(self):
+        assert np.array_equal(
+            np.asarray(self.builder().build(pbar=False, lazy=False).array),
+            np.asarray(
+                self.builder(probe_positions=1).build(pbar=False, lazy=False).array
+            ),
+        )
+
+    def test_averaging_changes_the_result(self):
+        single = self.builder().build(pbar=False, lazy=False)
+        averaged = self.builder(probe_positions=3).build(pbar=False, lazy=False)
+        assert single.array.shape == averaged.array.shape
+        assert not np.allclose(single.array, averaged.array, rtol=1e-3)
+
+    def test_it_is_the_mean_over_the_positions(self):
+        # The average is incoherent: the mean of the per-position patterns.
+        builder = self.builder(probe_positions=2)
+        averaged = np.asarray(builder.build(pbar=False, lazy=False).array)
+
+        slab, rotation = rotated_slab(
+            builder.atoms, builder.zone_axes[0], builder.slab_cell
+        )
+        directions = builder.build(pbar=False, lazy=False).directions
+        per_position = EBSD(
+            abtem.Potential(
+                slab,
+                gpts=builder.potential_gpts,
+                slice_thickness=1.0,
+                projection="finite",
+            ),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            detector=BackscatterDetector(directions=directions @ rotation.T),
+        ).scan(scan=builder.probe_scan, lazy=False)
+
+        assert np.allclose(
+            averaged, np.asarray(per_position.array).mean(axis=0), rtol=1e-5
+        )
+
+    def test_records_the_count_in_the_metadata(self):
+        pattern = self.builder(probe_positions=3).build(pbar=False, lazy=False)
+        metadata = pattern.metadata
+        assert metadata["probe_positions"] == 3
+
+    def test_works_lazily(self):
+        eager = self.builder(probe_positions=2).build(pbar=False, lazy=False)
+        lazy = self.builder(probe_positions=2).build(lazy=True)
+        assert lazy.is_lazy
+        # The lazy path splits the directions into more blocks, which changes
+        # the FFT batch size and so the last digits; see
+        # test_the_block_size_sets_the_last_digits.
+        assert np.allclose(
+            np.asarray(lazy.compute().array), np.asarray(eager.array), rtol=1e-4
+        )
+
+    def test_the_block_size_sets_the_last_digits(self):
+        # Not a property of laziness: batching the directions differently
+        # changes the FFT batch size and hence the plan, and float32 rounds
+        # differently. The eager path shows the same shift.
+        default = np.asarray(
+            self.builder(probe_positions=2).build(pbar=False, lazy=False).array
+        )
+        one_at_a_time = np.asarray(
+            self.builder(probe_positions=2)
+            .build(pbar=False, lazy=False, max_batch_directions=1)
+            .array
+        )
+        assert not np.array_equal(default, one_at_a_time)
+        assert np.allclose(default, one_at_a_time, rtol=1e-4)
+
+    def test_rejects_a_bad_count(self):
+        with pytest.raises(ValueError, match="probe_positions must be at least 1"):
+            self.builder(probe_positions=0)
