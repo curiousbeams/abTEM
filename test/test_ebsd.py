@@ -29,6 +29,7 @@ from abtem.ebsd.reciprocity import (
 )
 from abtem.ebsd.reference import (
     EBSDReferencePattern,
+    fft_friendly_gpts,
     patch_half_angle,
     recommended_sampling,
 )
@@ -727,7 +728,7 @@ class TestEBSDReferencePattern:
         direct = EBSD(
             abtem.Potential(
                 slab,
-                sampling=builder.sampling,
+                gpts=builder.potential_gpts,
                 slice_thickness=1.0,
                 projection="finite",
             ),
@@ -1092,3 +1093,37 @@ class TestDepthTolerance:
         a = make_ebsd(atoms, detector, depth_tolerance=0.0).scan()
         b = make_ebsd(atoms, detector).scan()
         assert np.array_equal(a.array, b.array)
+
+
+class TestFFTFriendlyGpts:
+    def test_never_coarser_than_requested(self):
+        for sampling in (0.05, 0.1414, 0.17, 0.3):
+            gpts = fft_friendly_gpts((10.0, 10.0), sampling)
+            assert all(10.0 / n <= sampling for n in gpts)
+
+    def test_avoids_awkward_sizes(self):
+        # 71 is prime, and its transform is slower than one twice the size.
+        assert fft_friendly_gpts((10.0, 10.0), 10.0 / 71) == (72, 72)
+
+    def test_only_small_prime_factors(self):
+        for sampling in (0.05, 0.1414, 0.17, 0.3):
+            for n in fft_friendly_gpts((10.0, 10.0), sampling):
+                remainder = n
+                for prime in (2, 3, 5, 7, 11):
+                    while remainder % prime == 0:
+                        remainder //= prime
+                assert remainder == 1, n
+
+    def test_handles_unequal_extents(self):
+        assert fft_friendly_gpts((10.0, 20.0), 0.2) == (50, 100)
+
+    def test_the_builder_uses_it(self):
+        builder = EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=400,
+            slab_cell=(10.0, 10.0, 40.0),
+        )
+        assert builder.potential_gpts == fft_friendly_gpts(
+            (10.0, 10.0), builder.sampling
+        )

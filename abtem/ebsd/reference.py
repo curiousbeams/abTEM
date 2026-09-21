@@ -30,7 +30,12 @@ from abtem.ebsd.reciprocity import EBSD, AntialiasLossWarning, DepthWeight
 from abtem.potentials.iam import Potential
 from abtem.waves import Probe
 
-__all__ = ["EBSDReferencePattern", "patch_half_angle", "recommended_sampling"]
+__all__ = [
+    "EBSDReferencePattern",
+    "patch_half_angle",
+    "recommended_sampling",
+    "fft_friendly_gpts",
+]
 
 #: Fraction of the antialias-limited sampling used by default.
 #:
@@ -51,6 +56,35 @@ _SAMPLING_SAFETY = 0.8
 #: Density of the direction grid relative to the output image, so that binning
 #: leaves no empty pixels at the rim where the grid thins out.
 _DIRECTION_OVERSAMPLING = 1.15
+
+
+def fft_friendly_gpts(extent: tuple[float, float], sampling: float) -> tuple[int, int]:
+    """Grid points covering `extent` at `sampling` or finer, sized for the FFT.
+
+    The calculation is almost entirely Fresnel propagation, so its cost is set
+    by how fast an FFT of this size is rather than by how many points there
+    are. Those are not the same thing: a grid of 71 points -- prime, so the
+    transform falls back to Bloom/Rader -- takes five times as long as one of
+    72, and longer than one of 128. Rounding *up* to the next size with only
+    small prime factors makes the sampling finer, so it can only help the
+    antialias margin, and it is typically several times faster.
+
+    Parameters
+    ----------
+    extent : two float
+        Lateral extent of the grid [Å].
+    sampling : float
+        Largest acceptable sampling [Å].
+
+    Returns
+    -------
+    gpts : two int
+    """
+    from scipy.fft import next_fast_len  # type: ignore[import-untyped]
+
+    return tuple(  # type: ignore[return-value]
+        int(next_fast_len(int(np.ceil(length / sampling)))) for length in extent[:2]
+    )
 
 
 def patch_half_angle(n_patches: int, coverage: float = 1.2) -> float:
@@ -271,8 +305,18 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
     @property
     def sampling(self) -> float:
-        """Real-space sampling of the potential [Å]."""
+        """Largest acceptable real-space sampling of the potential [Å]."""
         return self._sampling
+
+    @property
+    def potential_gpts(self) -> tuple[int, int]:
+        """Grid the potential is built on.
+
+        Derived from :attr:`sampling` and rounded up to a size the FFT handles
+        quickly; see :func:`fft_friendly_gpts`. The actual sampling is
+        therefore a little finer than :attr:`sampling`.
+        """
+        return fft_friendly_gpts(self._slab_cell[:2], self._sampling)
 
     def _assign_directions(self) -> list[np.ndarray]:
         """Group the sampled directions by the patch that will calculate them.
@@ -323,6 +367,10 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
         block = bulk_block(self._atoms, self._slab_cell, self._repetitions)
 
+        # Every patch shares a slab shape and a sampling, so the grid is chosen
+        # once -- at a size the FFT likes, which dominates the runtime.
+        gpts = self.potential_gpts
+
         cutoff = np.cos(self._max_angle * 1e-3)
 
         patterns: list[SphericalPattern] = []
@@ -353,7 +401,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                     result = EBSD(
                         Potential(
                             slab,
-                            sampling=self._sampling,
+                            gpts=gpts,
                             slice_thickness=self._slice_thickness,
                             projection="finite",
                             device=self._device,
@@ -386,6 +434,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                 "n_patches": self._n_patches,
                 "max_angle": self._max_angle,
                 "sampling": self._sampling,
+                "gpts": gpts,
                 "projection": self._projection.name,
                 "antialias_loss_max": max_loss,
             }

@@ -25,6 +25,7 @@ from abtem.ebsd.projections import (
 from abtem.ebsd.reciprocity import EBSD
 from abtem.ebsd.reference import (
     EBSDReferencePattern,
+    fft_friendly_gpts,
     patch_half_angle,
     recommended_sampling,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "EBSD",
     "EBSDReferencePattern",
     "patch_half_angle",
+    "fft_friendly_gpts",
     "recommended_sampling",
     "BackscatterDetector",
     "small_angle_error",
