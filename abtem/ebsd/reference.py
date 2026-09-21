@@ -20,6 +20,7 @@ from typing import Optional
 import numpy as np
 from ase import Atoms
 
+from abtem.array import validate_lazy
 from abtem.core.diagnostics import TqdmWrapper
 from abtem.core.energy import energy2wavelength
 from abtem.core.utils import CopyMixin, EqualityMixin
@@ -483,20 +484,31 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
         return [np.where(assigned[:, j])[0] for j in range(len(zone_axes))]
 
-    def compute(
+    def build(
         self,
         max_batch_directions: int | str = "auto",
+        lazy: Optional[bool] = None,
         pbar: bool = True,
     ) -> SphericalPattern:
         """Run every patch and stitch the results into one pattern.
+
+        Named for the abTEM builders it follows -- :meth:`abtem.Probe.build`,
+        :meth:`abtem.SMatrix.build` -- which leaves ``compute`` to mean what it
+        means everywhere else: realize a lazy array. So ``build(lazy=True)``
+        returns a pattern whose ``compute()`` runs it.
 
         Parameters
         ----------
         max_batch_directions : int or str, optional
             Directions propagated at once within each patch. Passed to
             :meth:`~abtem.ebsd.reciprocity.EBSD.scan`.
+        lazy : bool, optional
+            If True, return a pattern backed by a dask graph with one task per
+            patch, rather than running them here. Defaults to the abTEM
+            configuration.
         pbar : bool, optional
-            If True (default), show a progress bar over the patches.
+            If True (default), show a progress bar over the patches. Ignored
+            when lazy, where nothing runs yet.
 
         Returns
         -------
@@ -505,6 +517,8 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
             frame. Use :meth:`SphericalPattern.project` to turn it into an
             image.
         """
+        lazy = validate_lazy(lazy)
+
         directions = self.directions
         zone_axes = self.zone_axes
         assignment = self._assign_directions()
@@ -520,7 +534,9 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         patterns: list[SphericalPattern] = []
         max_loss = 0.0
 
-        progress = TqdmWrapper(total=len(zone_axes), enabled=pbar, leave=False)
+        progress = TqdmWrapper(
+            total=len(zone_axes), enabled=pbar and not lazy, leave=False
+        )
         try:
             for zone_axis, indices in zip(zone_axes, assignment):
                 slab, rotation = rotated_slab(
@@ -555,14 +571,13 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                         potential_weighting=self._potential_weighting,
                         depth_weight=self._depth_weight,
                         device=self._device,
-                    ).scan(max_batch_directions=max_batch_directions)
+                    ).scan(max_batch_directions=max_batch_directions, lazy=lazy)
 
-                max_loss = max(max_loss, result.metadata["antialias_loss_max"])
+                if not lazy:
+                    max_loss = max(max_loss, result.metadata["antialias_loss_max"])
 
                 patterns.append(
-                    SphericalPattern(
-                        np.asarray(result.array), directions=directions[indices]
-                    )
+                    SphericalPattern(result.array, directions=directions[indices])
                 )
         finally:
             progress.close_if_exists()
@@ -580,11 +595,11 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                 "sampling": self._sampling,
                 "gpts": gpts,
                 "projection": self._projection.name,
-                "antialias_loss_max": max_loss,
+                **({} if lazy else {"antialias_loss_max": max_loss}),
             }
         )
 
-        if max_loss > 0.05:
+        if not lazy and max_loss > 0.05:
             warnings.warn(
                 f"the antialias aperture removed up to {max_loss:.1%} of the "
                 f"intensity of a reciprocity plane wave; consider a sampling "

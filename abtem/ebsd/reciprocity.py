@@ -36,10 +36,12 @@ from __future__ import annotations
 import warnings
 from typing import Callable, Literal, Optional, Sequence
 
+import dask.array as da
 import numpy as np
 from ase import Atoms
 
 from abtem.antialias import AntialiasAperture
+from abtem.array import validate_lazy
 from abtem.core.axes import AxisMetadata, EnergyAxis, OrdinalAxis
 from abtem.core.backend import get_array_module, validate_device
 from abtem.core.chunks import chunk_ranges, validate_chunks
@@ -148,6 +150,44 @@ def _validate_backscatter_energy(
         raise ValueError("the energy weights must not sum to zero")
 
     return energies, weights / total
+
+
+def _worker_count() -> int:
+    """Threads dask will run tasks on, as a target for the number of blocks."""
+    from dask.system import CPU_COUNT
+
+    return max(1, int(CPU_COUNT))
+
+
+def _antialias_message(loss: float) -> str:
+    return (
+        f"the antialias aperture removed {loss:.1%} of the intensity of at "
+        f"least one reciprocity plane wave; the collected angles are too large "
+        f"for this sampling"
+    )
+
+
+def _build_potential(potential: BasePotential) -> BasePotential:
+    """Build a potential as its own task, shared by the blocks that use it."""
+    return potential.build(lazy=False)
+
+
+def _propagate_block_intensities(
+    ebsd: "EBSD", potential: BasePotential, arguments: dict
+) -> np.ndarray:
+    """One block of directions, as a dask task.
+
+    The antialias loss cannot reach a lazy measurement's metadata, which is
+    fixed when the graph is built rather than when it runs, so the check that
+    would have produced it is made here instead and warns from inside the task.
+    """
+    intensities, loss = ebsd._propagate_block(potential=potential, **arguments)
+
+    maximum = float(loss.max())
+    if maximum > 0.05:
+        warnings.warn(_antialias_message(maximum), AntialiasLossWarning)
+
+    return np.asarray(intensities.get() if hasattr(intensities, "get") else intensities)
 
 
 class EBSD(CopyMixin, EqualityMixin):
@@ -280,8 +320,16 @@ class EBSD(CopyMixin, EqualityMixin):
         """Device the calculation runs on."""
         return self._device
 
-    def _direction_blocks(self, max_batch: int | str) -> list[tuple[int, int]]:
-        """Split the collected directions into batches that fit in memory."""
+    def _direction_blocks(
+        self, max_batch: int | str, lazy: bool = False
+    ) -> list[tuple[int, int]]:
+        """Split the collected directions into batches that fit in memory.
+
+        Blocks are the unit of work, so when they are going to become dask
+        tasks there have to be enough of them to occupy the workers. The
+        memory-derived size alone can leave three tasks on a twelve core
+        machine; this only ever splits further, never coarser.
+        """
         gpts = self._potential.gpts
         if gpts is None:
             raise RuntimeError("the potential has no grid")
@@ -296,13 +344,23 @@ class EBSD(CopyMixin, EqualityMixin):
             dtype=np.dtype("complex64"),
             device=self._device,
         )
-        return list(chunk_ranges(chunks)[0])
+        blocks = list(chunk_ranges(chunks)[0])
+
+        if lazy and len(blocks) < _worker_count():
+            size = int(np.ceil(len(self._detector) / _worker_count()))
+            size = min(size, max(stop - start for start, stop in blocks))
+            blocks = [
+                (start, min(start + size, len(self._detector)))
+                for start in range(0, len(self._detector), size)
+            ]
+
+        return blocks
 
     def scan(
         self,
         scan: Optional[BaseScan | Sequence] = None,
         max_batch_directions: int | str = "auto",
-        lazy: bool = False,
+        lazy: Optional[bool] = None,
         pbar: bool = False,
     ) -> DiffractionPatterns | SphericalPattern:
         """Calculate the backscatter pattern at each probe position.
@@ -318,7 +376,14 @@ class EBSD(CopyMixin, EqualityMixin):
             re-propagated once per batch, so larger batches are faster but use
             more memory.
         lazy : bool, optional
-            Not implemented; must be False.
+            If True, build a dask graph instead of computing, with one task per
+            block of directions per backscattered energy. Defaults to the abTEM
+            configuration. A lazy measurement carries no ``antialias_loss`` in
+            its metadata, since that is only known once the graph runs; the
+            check warns from inside the tasks instead.
+
+            Defaults to abTEM's ``dask.lazy`` configuration, which ships as
+            True, so ask for ``lazy=False`` to get an array back directly.
         pbar : bool, optional
             If True, show a progress bar over the slices.
 
@@ -331,17 +396,17 @@ class EBSD(CopyMixin, EqualityMixin):
             value per collected direction. Any probe positions appear as
             leading ensemble axes.
         """
-        if lazy:
-            raise NotImplementedError(
-                "the reciprocity EBSD calculation runs eagerly; pass lazy=False"
-            )
+        lazy = validate_lazy(lazy)
 
         xp = get_array_module(self._device)
 
-        potential = self._potential.build(lazy=False)
-        num_slices = potential.num_slices
+        # Only the geometry is needed to lay out the work; building the
+        # potential is deferred when lazy, so that 400 of them are neither
+        # built serially while the graph is assembled nor held in it at once.
+        num_slices = self._potential.num_slices
+        potential = self._potential if lazy else self._potential.build(lazy=False)
 
-        depths = np.cumsum(np.asarray(potential.slice_thickness, dtype=float))
+        depths = np.cumsum(np.asarray(self._potential.slice_thickness, dtype=float))
         weights = _validate_depth_weight(self._depth_weight, depths)
 
         probe = self._probe.copy()
@@ -366,52 +431,60 @@ class EBSD(CopyMixin, EqualityMixin):
         )
         n_energies = len(backscatter_energies)
 
+        blocks = self._direction_blocks(max_batch_directions, lazy=lazy)
+
+        def block_arguments(backscatter_energy, start, stop):
+            wave_vectors = xp.asarray(
+                self._detector.transverse_wave_vectors(backscatter_energy),
+                dtype=get_dtype(complex=False),
+            )[start:stop]
+            return dict(
+                source=source,
+                incident_norm=incident_norm,
+                wave_vectors=wave_vectors,
+                weights=weights,
+                energy=energy,
+                backscatter_energy=float(backscatter_energy),
+                n_directions=stop - start,
+                ensemble_shape=ensemble_shape,
+            )
+
+        if lazy:
+            return self._lazy_measurement(
+                potential=potential,
+                block_arguments=block_arguments,
+                blocks=blocks,
+                backscatter_energies=backscatter_energies,
+                energy_weights=energy_weights,
+                ensemble_shape=ensemble_shape,
+                ensemble_axes_metadata=ensemble_axes_metadata,
+                energy=energy,
+            )
+
         intensities = xp.zeros(
             (n_energies,) + ensemble_shape + (len(self._detector),), dtype=xp.float32
         )
         antialias_loss = xp.zeros((n_energies, len(self._detector)), dtype=xp.float32)
-
-        blocks = self._direction_blocks(max_batch_directions)
 
         progress = TqdmWrapper(
             total=n_energies * len(blocks) * num_slices, enabled=pbar, leave=False
         )
         try:
             for i, backscatter_energy in enumerate(backscatter_energies):
-                # The transverse wavevectors are k0(E) times the collected
-                # directions, so they change with the backscattered energy.
-                # Storing directions rather than wavevectors is what makes the
-                # detector reusable across the energies.
-                wave_vectors = xp.asarray(
-                    self._detector.transverse_wave_vectors(backscatter_energy),
-                    dtype=get_dtype(complex=False),
-                )
                 for start, stop in blocks:
-                    self._propagate_block(
+                    block, loss = self._propagate_block(
                         potential=potential,
-                        source=source,
-                        incident_norm=incident_norm,
-                        wave_vectors=wave_vectors[start:stop],
-                        weights=weights,
-                        energy=energy,
-                        backscatter_energy=float(backscatter_energy),
-                        intensities=intensities[i],
-                        antialias_loss=antialias_loss[i],
-                        start=start,
-                        stop=stop,
                         progress=progress,
+                        **block_arguments(backscatter_energy, start, stop),
                     )
+                    intensities[i][..., start:stop] = block
+                    antialias_loss[i][start:stop] = loss
         finally:
             progress.close_if_exists()
 
         max_loss = float(xp.max(antialias_loss))
         if max_loss > 0.05:
-            warnings.warn(
-                f"the antialias aperture removed {max_loss:.1%} of the intensity "
-                f"of at least one reciprocity plane wave; the collected angles "
-                f"are too large for this sampling",
-                AntialiasLossWarning,
-            )
+            warnings.warn(_antialias_message(max_loss), AntialiasLossWarning)
 
         if n_energies == 1:
             intensities = intensities[0]
@@ -430,6 +503,71 @@ class EBSD(CopyMixin, EqualityMixin):
             backscatter_energies=backscatter_energies,
         )
 
+    def _lazy_measurement(
+        self,
+        potential,
+        block_arguments,
+        blocks,
+        backscatter_energies,
+        energy_weights,
+        ensemble_shape,
+        ensemble_axes_metadata,
+        energy: float,
+    ) -> DiffractionPatterns | SphericalPattern:
+        """Assemble the same per-block computation into a dask graph.
+
+        Each block of directions, at each backscattered energy, is one task.
+        They share the built potential and the source, which the threaded
+        scheduler passes by reference rather than copying. The wavefields a
+        task propagates are its own, so only one block of them is resident at a
+        time however many directions were asked for.
+        """
+        import dask
+
+        n_energies = len(backscatter_energies)
+
+        # One task, so the blocks of this patch share the built potential and
+        # dask frees it once they are done with it.
+        built = dask.delayed(_build_potential, pure=True)(potential)
+
+        rows = []
+        for backscatter_energy in backscatter_energies:
+            columns = []
+            for start, stop in blocks:
+                block = dask.delayed(_propagate_block_intensities, pure=True)(
+                    self, built, block_arguments(backscatter_energy, start, stop)
+                )
+                columns.append(
+                    da.from_delayed(
+                        block,
+                        shape=ensemble_shape + (stop - start,),
+                        dtype=np.float32,
+                    )
+                )
+            rows.append(da.concatenate(columns, axis=-1))
+
+        array = da.stack(rows, axis=0)
+
+        if n_energies == 1:
+            array = array[0]
+        else:
+            ensemble_axes_metadata = [
+                EnergyAxis(values=tuple(float(e) for e in backscatter_energies))
+            ] + ensemble_axes_metadata
+
+        if self._detector.is_grid:
+            # The two base axes of a diffraction pattern have to be one chunk.
+            array = array.rechunk(array.chunks[:-1] + (-1,))
+
+        return self._to_measurement(
+            array,
+            ensemble_axes_metadata=ensemble_axes_metadata,
+            energy=energy,
+            antialias_loss=None,
+            energy_weights=energy_weights,
+            backscatter_energies=backscatter_energies,
+        )
+
     def _propagate_block(
         self,
         potential,
@@ -439,13 +577,15 @@ class EBSD(CopyMixin, EqualityMixin):
         weights: np.ndarray,
         energy: float,
         backscatter_energy: float,
-        intensities,
-        antialias_loss,
-        start: int,
-        stop: int,
-        progress: TqdmWrapper,
-    ) -> None:
+        n_directions: int,
+        ensemble_shape: tuple[int, ...],
+        progress: Optional[TqdmWrapper] = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Co-propagate the source and one batch of reciprocity waves.
+
+        Returns the block's own intensities and antialias losses rather than
+        writing into a shared buffer, so the same routine serves the eager
+        assembly and the lazy one, where each block is a separate task.
 
         Both wavefields are advanced through the same slice before their
         overlap is accumulated, so the depth-resolved source never has to be
@@ -472,6 +612,8 @@ class EBSD(CopyMixin, EqualityMixin):
             ensemble_axes_metadata=[OrdinalAxis(values=tuple(range(len(array))))],
         )
         initial_norm = xp.sum(xp.abs(reciprocity.array) ** 2, axis=(-2, -1))
+
+        intensities = xp.zeros(incident_norm.shape + (n_directions,), dtype=xp.float32)
 
         # The source is re-propagated for every block, so start from a copy.
         beam = source.copy()
@@ -533,14 +675,18 @@ class EBSD(CopyMixin, EqualityMixin):
                     incident_norm=incident_norm,
                     weight=weight,
                     intensities=intensities,
-                    start=start,
-                    stop=stop,
+                    n_directions=n_directions,
                 )
 
-            progress.update_if_exists(1)
+            if progress is not None:
+                progress.update_if_exists(1)
 
         final_norm = xp.sum(xp.abs(reciprocity.array) ** 2, axis=(-2, -1))
-        antialias_loss[start:stop] = 1.0 - final_norm / initial_norm
+
+        # incident_norm flattens the scan positions; give them back their shape
+        intensities = intensities.reshape(ensemble_shape + (n_directions,))
+
+        return intensities, 1.0 - final_norm / initial_norm
 
     def _accumulate(
         self,
@@ -550,8 +696,7 @@ class EBSD(CopyMixin, EqualityMixin):
         incident_norm,
         weight: float,
         intensities,
-        start: int,
-        stop: int,
+        n_directions: int,
     ) -> None:
         """Add one slice's contribution to the collected intensities."""
         xp = get_array_module(self._device)
@@ -588,7 +733,7 @@ class EBSD(CopyMixin, EqualityMixin):
         # memory -- about seven times faster than abs()**2 on the strided
         # halves, and exactly equal.
         real_view = reciprocity.array.view(get_dtype(complex=False))
-        real_view = real_view.reshape(stop - start, -1)
+        real_view = real_view.reshape(n_directions, -1)
 
         source_flat = source.reshape(-1, real_view.shape[1] // 2)
         source_interleaved = xp.repeat(source_flat, 2, axis=-1)
@@ -596,9 +741,7 @@ class EBSD(CopyMixin, EqualityMixin):
         overlap = (real_view * real_view) @ source_interleaved.T
         overlap = overlap / incident_norm[None]
 
-        intensities[..., start:stop] += weight * overlap.T.reshape(
-            intensities.shape[:-1] + (stop - start,)
-        )
+        intensities += weight * overlap.T.reshape(intensities.shape)
 
     def _to_measurement(
         self,
@@ -610,19 +753,23 @@ class EBSD(CopyMixin, EqualityMixin):
         backscatter_energies: Optional[np.ndarray] = None,
     ) -> DiffractionPatterns | SphericalPattern:
         """Wrap the collected intensities in the matching measurement type."""
-        array = np.asarray(
-            intensities.get() if hasattr(intensities, "get") else intensities
-        )
-        loss = np.asarray(
-            antialias_loss.get() if hasattr(antialias_loss, "get") else antialias_loss
-        )
+        array: np.ndarray | da.core.Array
+        if isinstance(intensities, da.core.Array):
+            array = intensities
+        else:
+            array = np.asarray(
+                intensities.get() if hasattr(intensities, "get") else intensities
+            )
+        metadata = {"energy": energy, "label": "backscattered intensity"}
 
-        metadata = {
-            "energy": energy,
-            "label": "backscattered intensity",
-            "antialias_loss_max": float(loss.max()),
-            "antialias_loss_mean": float(loss.mean()),
-        }
+        if antialias_loss is not None:
+            loss = np.asarray(
+                antialias_loss.get()
+                if hasattr(antialias_loss, "get")
+                else antialias_loss
+            )
+            metadata["antialias_loss_max"] = float(loss.max())
+            metadata["antialias_loss_mean"] = float(loss.mean())
 
         if (
             backscatter_energies is not None

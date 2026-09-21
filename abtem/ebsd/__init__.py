@@ -22,7 +22,7 @@ from abtem.ebsd.projections import (
     pixel_centers,
     validate_projection,
 )
-from abtem.ebsd.reciprocity import EBSD
+from abtem.ebsd.reciprocity import EBSD, AntialiasLossWarning
 from abtem.ebsd.reference import (
     EBSDReferencePattern,
     fft_friendly_gpts,
@@ -34,6 +34,7 @@ from abtem.ebsd.reference import (
 
 __all__ = [
     "EBSD",
+    "AntialiasLossWarning",
     "EBSDReferencePattern",
     "patch_half_angle",
     "fft_friendly_gpts",

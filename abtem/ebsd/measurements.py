@@ -5,6 +5,7 @@ from __future__ import annotations
 import warnings
 from typing import Optional, Sequence, cast
 
+import dask.array as da
 import numpy as np
 import zarr
 
@@ -74,12 +75,14 @@ class SphericalPattern(CopyMixin, EqualityMixin):
 
     def __init__(
         self,
-        array: np.ndarray,
+        array: np.ndarray | da.core.Array,
         directions: np.ndarray,
         ensemble_axes_metadata: Optional[list[AxisMetadata]] = None,
         metadata: Optional[dict] = None,
     ):
-        array = np.asarray(array)
+        # A dask array is kept as it is; np.asarray would compute it.
+        if not isinstance(array, da.core.Array):
+            array = np.asarray(array)
         directions = np.asarray(directions, dtype=float)
 
         if directions.ndim != 2 or directions.shape[1] != 3:
@@ -105,9 +108,37 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             )
 
     @property
-    def array(self) -> np.ndarray:
+    def array(self) -> np.ndarray | da.core.Array:
         """The intensities, of shape ``(..., N)``."""
         return self._array
+
+    @property
+    def is_lazy(self) -> bool:
+        """Whether the intensities are a dask array awaiting computation."""
+        return isinstance(self._array, da.core.Array)
+
+    def compute(self, **kwargs) -> "SphericalPattern":
+        """Compute a lazy pattern, returning one holding a plain array.
+
+        Parameters
+        ----------
+        kwargs :
+            Passed to :meth:`dask.array.Array.compute`.
+
+        Returns
+        -------
+        pattern : SphericalPattern
+            Self, if the pattern was not lazy.
+        """
+        if not isinstance(self._array, da.core.Array):
+            return self
+
+        return self.__class__(
+            self._array.compute(**kwargs),
+            self._directions,
+            ensemble_axes_metadata=self._ensemble_axes_metadata,
+            metadata=self._metadata,
+        )
 
     @property
     def directions(self) -> np.ndarray:
@@ -167,6 +198,12 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         from scipy.interpolate import griddata  # type: ignore[import-untyped]
 
         projection = validate_projection(projection)
+
+        if self.is_lazy:
+            raise RuntimeError(
+                "compute() the pattern before interpolating it; the "
+                "interpolation is not built as a dask graph"
+            )
 
         northern = self._directions[:, 2] >= 0.0
         source = projection.project(self._directions[northern])
@@ -235,6 +272,12 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             The projected pattern. Pixels no direction falls into are zero.
         """
         projection = validate_projection(projection)
+
+        if self.is_lazy:
+            raise RuntimeError(
+                "compute() the pattern before projecting it; the binning is "
+                "not built as a dask graph"
+            )
 
         flat = self._array.reshape(-1, len(self._directions))
         binned = [
@@ -308,6 +351,9 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             If True, replace an existing store (default False).
         """
         from abtem.core.axes import axis_to_dict
+
+        if self.is_lazy:
+            raise RuntimeError("compute() the pattern before writing it")
 
         root = zarr.open_group(url, mode="w" if overwrite else "w-")
         root.create_array("array", shape=self._array.shape, dtype=self._array.dtype)[

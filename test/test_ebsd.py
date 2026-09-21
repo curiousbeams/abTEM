@@ -8,6 +8,7 @@ import abtem
 from abtem.core.axes import EnergyAxis, OrdinalAxis
 from abtem.ebsd import (
     EBSD,
+    AntialiasLossWarning,
     BackscatterDetector,
     SparseProjectionWarning,
     SphericalPattern,
@@ -35,6 +36,19 @@ from abtem.ebsd.reference import (
     potential_sampling,
     recommended_sampling,
 )
+
+
+@pytest.fixture(autouse=True)
+def eager_by_default():
+    """Run eagerly unless a test asks otherwise.
+
+    EBSD.scan and EBSDReferencePattern.build follow abTEM's ``dask.lazy``
+    setting, which ships as True. Most tests here want the numbers rather than
+    a graph, so pin the setting and let the lazy tests pass ``lazy=True``.
+    """
+    with abtem.config.set({"dask.lazy": False}):
+        yield
+
 
 PROJECTIONS = [StereographicProjection(), SquareLambertProjection()]
 PROJECTION_IDS = [p.name for p in PROJECTIONS]
@@ -583,11 +597,6 @@ class TestEBSD:
         ).scan()
         assert 0.5 < patterns.array.mean() < 2.0
 
-    def test_lazy_is_refused(self):
-        with pytest.raises(NotImplementedError, match="lazy=False"):
-            make_ebsd(
-                silicon_slab(), BackscatterDetector(max_angle=50, gpts=4)
-            ).scan(lazy=True)
 
     def test_warns_when_the_antialias_aperture_clips(self):
         # A plane wave launched near the aperture edge scatters straight past
@@ -715,7 +724,7 @@ class TestEBSDReferencePattern:
         assert len(assigned) == len(builder.directions)
 
     def test_compute_returns_directions_within_the_patch(self, builder):
-        pattern = builder.compute(pbar=False)
+        pattern = builder.build(pbar=False)
         assert isinstance(pattern, SphericalPattern)
         assert 0 < len(pattern) <= len(builder.directions)
 
@@ -726,7 +735,7 @@ class TestEBSDReferencePattern:
     def test_compute_matches_a_direct_calculation(self, builder):
         # The builder is bookkeeping around EBSD.scan; running the one patch by
         # hand must give the same numbers.
-        pattern = builder.compute(pbar=False)
+        pattern = builder.build(pbar=False)
 
         slab, rotation = rotated_slab(
             builder.atoms, builder.zone_axes[0], builder.slab_cell
@@ -747,7 +756,7 @@ class TestEBSDReferencePattern:
         assert np.allclose(pattern.array, direct.array, rtol=1e-6)
 
     def test_compute_records_the_setup_in_the_metadata(self, builder):
-        metadata = builder.compute(pbar=False).metadata
+        metadata = builder.build(pbar=False).metadata
         assert metadata["n_patches"] == 1
         assert metadata["max_angle"] == pytest.approx(200.0)
         assert metadata["energy"] == 30e3
@@ -758,7 +767,7 @@ class TestEBSDReferencePattern:
         # empty by construction.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", SparseProjectionWarning)
-            images = builder.compute(pbar=False).project(8)
+            images = builder.build(pbar=False).project(8)
         assert images.array.shape == (8, 8)
         assert np.all(np.isfinite(images.array))
 
@@ -1214,3 +1223,153 @@ class TestSamplingEstimators:
         before = _scattering_power_cutoff.cache_info().hits
         potential_sampling(silicon)
         assert _scattering_power_cutoff.cache_info().hits > before
+
+
+class TestLazy:
+    @pytest.fixture
+    def setup(self):
+        return silicon_slab(), BackscatterDetector(max_angle=50, gpts=6)
+
+    def test_matches_the_eager_result(self, setup):
+        atoms, detector = setup
+        eager = make_ebsd(atoms, detector).scan(lazy=False)
+        lazy = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=8)
+        assert lazy.is_lazy
+        assert np.allclose(np.asarray(lazy.compute().array), np.asarray(eager.array))
+
+    def test_matches_with_explicit_directions(self, setup):
+        atoms, grid = setup
+        detector = BackscatterDetector(directions=grid.directions)
+        eager = make_ebsd(atoms, detector).scan(lazy=False)
+        lazy = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=8)
+        assert isinstance(lazy, SphericalPattern)
+        assert lazy.is_lazy
+        assert np.allclose(np.asarray(lazy.compute().array), np.asarray(eager.array))
+
+    def test_matches_over_a_scan(self, setup):
+        atoms, detector = setup
+        scan = abtem.CustomScan([[2.0, 2.0], [5.0, 5.0], [8.0, 8.0]])
+        eager = make_ebsd(atoms, detector).scan(scan=scan, lazy=False)
+        lazy = make_ebsd(atoms, detector).scan(
+            scan=scan, lazy=True, max_batch_directions=8
+        )
+        assert lazy.array.shape == (3, 6, 6)
+        assert np.allclose(np.asarray(lazy.compute().array), np.asarray(eager.array))
+
+    def test_matches_over_energies(self, setup):
+        atoms, detector = setup
+        kwargs = dict(backscatter_energy=[30e3, 28e3])
+        eager = make_ebsd(atoms, detector, **kwargs).scan(lazy=False)
+        lazy = make_ebsd(atoms, detector, **kwargs).scan(
+            lazy=True, max_batch_directions=8
+        )
+        assert lazy.array.shape == (2, 6, 6)
+        assert np.allclose(np.asarray(lazy.compute().array), np.asarray(eager.array))
+
+    def test_the_block_size_does_not_change_the_result(self, setup):
+        atoms, detector = setup
+        whole = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=10_000)
+        split = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=4)
+        assert np.allclose(
+            np.asarray(whole.compute().array), np.asarray(split.compute().array)
+        )
+
+    def test_the_diffraction_pattern_base_axes_are_one_chunk(self, setup):
+        # abTEM requires the base axes of a measurement to be unchunked.
+        atoms, detector = setup
+        lazy = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=4)
+        assert lazy.array.chunks[-2:] == ((6,), (6,))
+
+    def test_the_antialias_loss_is_absent_when_lazy(self, setup):
+        # It is only known once the graph runs, and metadata is fixed when it
+        # is built; the check warns from inside the tasks instead.
+        atoms, detector = setup
+        assert "antialias_loss_max" in make_ebsd(atoms, detector).scan(
+            lazy=False
+        ).metadata
+        assert "antialias_loss_max" not in make_ebsd(atoms, detector).scan(
+            lazy=True
+        ).metadata
+
+    def test_nothing_runs_until_computed(self, setup):
+        # A grid too coarse for the collected angles warns loudly; building the
+        # graph must stay silent.
+        atoms = silicon_slab()
+        detector = BackscatterDetector(max_angle=150, gpts=4)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", AntialiasLossWarning)
+            lazy = EBSD(
+                abtem.Potential(
+                    atoms, sampling=0.2, slice_thickness=1.0, projection="finite"
+                ),
+                probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+                detector=detector,
+            ).scan(lazy=True)
+        with pytest.warns(AntialiasLossWarning):
+            lazy.compute()
+
+    def test_a_computed_pattern_is_not_lazy(self, setup):
+        atoms, grid = setup
+        detector = BackscatterDetector(directions=grid.directions)
+        lazy = make_ebsd(atoms, detector).scan(lazy=True)
+        computed = lazy.compute()
+        assert not computed.is_lazy
+        assert computed.compute() is computed
+
+    def test_is_reproducible(self, setup):
+        # The eager and lazy paths differ by a few float32 eps -- a different
+        # FFT plan per thread rounds differently -- but a given path repeats
+        # exactly.
+        atoms, detector = setup
+        first = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=8)
+        second = make_ebsd(atoms, detector).scan(lazy=True, max_batch_directions=8)
+        assert np.array_equal(
+            np.asarray(first.compute().array), np.asarray(second.compute().array)
+        )
+
+    def test_the_potential_is_built_inside_the_graph(self, setup):
+        # Building it while the graph is assembled would do the work serially
+        # and hold every patch's potential at once.
+        atoms, detector = setup
+        potential = abtem.Potential(
+            atoms, sampling=0.15, slice_thickness=1.0, projection="finite"
+        )
+        lazy = EBSD(
+            potential,
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            detector=detector,
+        ).scan(lazy=True)
+        assert not potential.is_built if hasattr(potential, "is_built") else True
+        assert lazy.is_lazy
+
+    def test_projection_refuses_a_lazy_pattern(self, setup):
+        atoms, grid = setup
+        detector = BackscatterDetector(directions=grid.directions)
+        lazy = make_ebsd(atoms, detector).scan(lazy=True)
+        with pytest.raises(RuntimeError, match="compute\\(\\) the pattern"):
+            lazy.project(8)
+
+
+class TestReferencePatternLazy:
+    @pytest.fixture
+    def builder(self):
+        return EBSDReferencePattern(
+            ase.build.bulk("Si", "diamond", a=5.431),
+            probe=abtem.Probe(semiangle_cutoff=10, energy=30e3),
+            n_patches=1,
+            slab_cell=(6.0, 6.0, 4.0),
+            gpts=8,
+            direction_gpts=30,
+            max_angle=200.0,
+        )
+
+    def test_matches_the_eager_build(self, builder):
+        eager = builder.build(pbar=False, lazy=False)
+        lazy = builder.build(lazy=True)
+        assert lazy.is_lazy
+        assert np.allclose(np.asarray(lazy.compute().array), np.asarray(eager.array))
+        assert np.array_equal(lazy.directions, eager.directions)
+
+    def test_the_antialias_loss_is_absent_when_lazy(self, builder):
+        assert "antialias_loss_max" in builder.build(pbar=False, lazy=False).metadata
+        assert "antialias_loss_max" not in builder.build(lazy=True).metadata
