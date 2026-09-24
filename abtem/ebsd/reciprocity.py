@@ -790,8 +790,16 @@ class EBSD(CopyMixin, EqualityMixin):
         real_view = reciprocity.array.view(get_dtype(complex=False))
         real_view = real_view.reshape(n_directions, -1)
 
+        # The interleave is built from a one-dimensional repeat rather than
+        # `repeat(source_flat, 2, axis=-1)`. The two are exactly equal -- row
+        # -major order puts each position's pixels contiguously, so duplicating
+        # pairwise reproduces the interleave -- but cupy's axis-ed path is
+        # pathologically slow: 482 ms against 0.0 ms for half a megabyte, which
+        # was the whole of a 169x slowdown on the GPU.
         source_flat = source.reshape(-1, real_view.shape[1] // 2)
-        source_interleaved = xp.repeat(source_flat, 2, axis=-1)
+        source_interleaved = xp.repeat(source_flat.ravel(), 2).reshape(
+            source_flat.shape[0], -1
+        )
 
         overlap = (real_view * real_view) @ source_interleaved.T
         overlap = overlap / incident_norm[None]
