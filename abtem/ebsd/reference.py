@@ -14,49 +14,44 @@ crystal frame and each slab frame, and the stitching.
 from __future__ import annotations
 
 import warnings
-from functools import lru_cache
 from typing import Optional
 
+import dask.array as da
 import numpy as np
 from ase import Atoms
 
 from abtem.array import validate_lazy
+from abtem.core.axes import EnergyAxis
 from abtem.core.diagnostics import TqdmWrapper
-from abtem.core.energy import energy2wavelength
 from abtem.core.utils import CopyMixin, EqualityMixin
 from abtem.ebsd.detectors import BackscatterDetector
 from abtem.ebsd.measurements import SphericalPattern
-from abtem.ebsd.orientations import bulk_block, fibonacci_hemisphere, rotated_slab
+from abtem.ebsd.orientations import (
+    _crystal_and_displacements,
+    _displaced,
+    bulk_block,
+    central_origin,
+    estimate_repetitions,
+    fibonacci_hemisphere,
+    is_centrosymmetric,
+    rotated_slab,
+    zone_axis_rotation,
+)
 from abtem.ebsd.projections import HemisphereProjection, validate_projection
-from abtem.ebsd.reciprocity import EBSD, AntialiasLossWarning, DepthWeight
+from abtem.ebsd.reciprocity import EBSD, DepthWeight, _validate_backscatter_energy
+from abtem.ebsd.sampling import (
+    AntialiasLossWarning,
+    _warn_if_undersampled,
+    potential_sampling,
+)
+from abtem.inelastic.phonons import FrozenPhonons
 from abtem.potentials.iam import Potential
-from abtem.scan import CustomScan
-from abtem.waves import Probe
 
 __all__ = [
     "EBSDReferencePattern",
     "patch_half_angle",
     "fft_friendly_gpts",
-    "maximum_sampling",
-    "potential_sampling",
-    "recommended_sampling",
 ]
-
-#: Fraction of the antialias-limited sampling used by default.
-#:
-#: A margin is essential rather than cosmetic: a plane wave launched right at
-#: the aperture edge scatters straight past it, and sampling exactly at the
-#: limit (safety = 1.0) loses about 96% of its intensity. Measured on a 40 Å
-#: silicon slab collecting 132 mrad, the loss falls off as
-#:
-#:     safety  1.0     0.9    0.8    0.7    0.6
-#:     loss    95.9%   4.3%   2.4%   1.3%   0.7%
-#:
-#: 0.8 keeps the recommended sampling comfortably below the 5% loss that
-#: :class:`~abtem.ebsd.reciprocity.AntialiasLossWarning` reports, so a
-#: default-configured run does not warn about its own defaults. 0.9 sits right
-#: on that boundary and trips it for some detector geometries.
-_SAMPLING_SAFETY = 0.8
 
 #: Density of the direction grid relative to the output image, so that binning
 #: leaves no empty pixels at the rim where the grid thins out.
@@ -71,8 +66,8 @@ def fft_friendly_gpts(extent: tuple[float, float], sampling: float) -> tuple[int
     are. Those are not the same thing: a grid of 71 points -- prime, so the
     transform falls back to Bloom/Rader -- takes five times as long as one of
     72, and longer than one of 128. Rounding *up* to the next size with only
-    small prime factors makes the sampling finer, so it can only help the
-    antialias margin, and it is typically several times faster.
+    small prime factors makes the sampling finer, so it can only help, and it
+    is typically several times faster.
 
     Parameters
     ----------
@@ -122,171 +117,45 @@ def patch_half_angle(n_patches: int, coverage: float = 1.2) -> float:
     )
 
 
-def maximum_sampling(
-    energy: float, max_angle: float, safety: float = _SAMPLING_SAFETY
-) -> float:
-    """Coarsest sampling that still carries a given scattering angle.
+def _patch_intensities(
+    builder: "EBSDReferencePattern",
+    block: Atoms,
+    slab_axis: np.ndarray,
+    local: np.ndarray,
+    origin: Optional[np.ndarray],
+    gpts: tuple[int, int],
+    max_batch_directions: int | str,
+) -> np.ndarray:
+    """Cut one patch's slab and collect its directions, eagerly.
 
-    The antialias aperture passes spatial frequencies up to two thirds of the
-    Nyquist frequency, so collecting a scattering angle ``a`` needs a sampling
-    finer than ``1 / (2 k) * 2 / 3`` with ``k = sin(a) / wavelength``.
-
-    This is an upper bound and not on its own a good choice: it says the grid
-    can *carry* the collected angles, not that it *resolves the potential*
-    producing them. See :func:`potential_sampling` for the second condition and
-    :func:`recommended_sampling` for both together.
-
-    Parameters
-    ----------
-    energy : float
-        Electron energy [eV].
-    max_angle : float
-        Largest collected scattering angle [mrad].
-    safety : float, optional
-        Fraction of the antialias limit to use (default 0.8). Sampling right at
-        the limit loses almost all the intensity of the steepest plane wave, so
-        the margin matters; see ``_SAMPLING_SAFETY``.
-
-    Returns
-    -------
-    sampling : float
-        Largest acceptable sampling [Å].
+    The unit of work of a reference pattern, whether the patches run one after
+    another or as tasks of a lazy one. Returns one value per direction of
+    `local`, after an energy axis if there are several backscattered energies.
     """
-    wave_number = np.sin(max_angle * 1e-3) / energy2wavelength(energy)
-    return float(1.0 / (2.0 * wave_number) * 2.0 / 3.0 * safety)
-
-
-@lru_cache(maxsize=32)
-def _scattering_power_cutoff(number: int, tolerance: float) -> float:
-    """Spatial frequency containing all but `tolerance` of an atom's scattering.
-
-    The projected potential of an atom is sharply peaked, and its transform
-    decays slowly -- the electron scattering factor has a Rutherford tail, so
-    there is no frequency beyond which it truly vanishes. What can be asked is
-    where all but a given fraction of its power lies.
-    """
-    # The tail of the spectrum matters to the total power, so the measuring
-    # grid has to reach well past the cutoff it is looking for. Converging on
-    # silicon: 512 points gives 0.066 A, 1024 gives 0.063, 2048 gives 0.062 and
-    # 4096 gives 0.0619. 1024 is within about 1.5% of the limit for light
-    # elements and 3% for gold, and costs a quarter of a second once per
-    # element. The slice thickness makes no difference at all for an isolated
-    # atom, and the box only a couple of percent.
-    extent, gpts, thickness = 8.0, 1024, 2.0
-
-    atoms = Atoms(
-        numbers=[number],
-        positions=[(extent / 2, extent / 2, thickness / 2)],
-        cell=(extent, extent, thickness),
-    )
-    projected = (
-        Potential(atoms, gpts=gpts, slice_thickness=thickness, projection="finite")
-        .build(lazy=False)
-        .array[0]
+    slab, _ = rotated_slab(
+        block, slab_axis, builder.slab_cell, repetitions=(1, 1, 1), origin=origin
     )
 
-    power = np.abs(np.fft.fft2(np.asarray(projected))) ** 2
-    frequencies = np.fft.fftfreq(gpts, d=extent / gpts)
-    radial = np.hypot(*np.meshgrid(frequencies, frequencies, indexing="ij"))
+    # A coarse sampling is warned about once, by the builder; per patch it
+    # would be several hundred copies of the same warning.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", AntialiasLossWarning)
+        result = EBSD(
+            Potential(
+                _displaced(slab, builder._frozen_phonons),
+                gpts=gpts,
+                slice_thickness=builder._slice_thickness,
+                projection="finite",
+                device=builder._device,
+            ),
+            BackscatterDetector(directions=local),
+            energy=builder.energy,
+            depth_weight=builder._depth_weight,
+            backscatter_energy=builder._backscatter_energy,
+            device=builder._device,
+        ).build(max_batch_directions=max_batch_directions, lazy=False)
 
-    order = np.argsort(radial.ravel())
-    cumulative = np.cumsum(power.ravel()[order])
-    cumulative /= cumulative[-1]
-
-    return float(radial.ravel()[order][np.searchsorted(cumulative, 1.0 - tolerance)])
-
-
-def potential_sampling(atoms: Atoms, tolerance: float = 0.01) -> float:
-    """Sampling that resolves the projected potential of `atoms`.
-
-    The antialias aperture discards whatever the grid cannot carry, so
-    scattering power beyond it is simply lost. This returns the sampling that
-    keeps all but `tolerance` of an isolated atom's projected scattering power
-    inside the aperture, taking the most demanding element present.
-
-    Calibrated against a convergence test on silicon at 30 kV, where the error
-    in the pattern relative to a far finer grid ran at one to three times the
-    power left outside the aperture:
-
-    ==========  ===============  ==============
-    sampling    power captured   pattern error
-    ==========  ===============  ==============
-    0.20 Å      90.5%            33%
-    0.14 Å      94.8%            16%
-    0.10 Å      97.3%            5.5%
-    0.07 Å      98.7%            0.6%
-    ==========  ===============  ==============
-
-    So the default ``tolerance=0.01`` targets roughly a percent, and the
-    returned value should be read as an estimate good to a factor of about two
-    rather than a guarantee. A convergence test remains the only proof.
-
-    Parameters
-    ----------
-    atoms : ase.Atoms
-        The specimen. Only which elements are present matters.
-    tolerance : float, optional
-        Fraction of the scattering power allowed to fall outside the antialias
-        aperture (default 0.01).
-
-    Returns
-    -------
-    sampling : float
-        Recommended sampling [Å].
-    """
-    if not 0.0 < tolerance < 1.0:
-        raise ValueError(f"tolerance must be between 0 and 1, got {tolerance}")
-
-    if len(atoms) == 0:
-        raise ValueError("cannot estimate a sampling for an empty cell")
-
-    cutoff = max(
-        _scattering_power_cutoff(int(number), tolerance)
-        for number in np.unique(atoms.numbers)
-    )
-    # the aperture passes |k| < 1 / (3 * sampling)
-    return float(1.0 / (3.0 * cutoff))
-
-
-def recommended_sampling(
-    energy: float,
-    max_angle: float,
-    atoms: Optional[Atoms] = None,
-    tolerance: float = 0.01,
-    safety: float = _SAMPLING_SAFETY,
-) -> float:
-    """Sampling that both carries the collected angles and resolves the atoms.
-
-    Two separate conditions have to hold, and for a typical EBSD geometry the
-    second is much the stricter: :func:`maximum_sampling` asks that the grid
-    can carry the collected scattering angles, :func:`potential_sampling` that
-    it resolves the potential doing the scattering. This returns the finer.
-
-    Parameters
-    ----------
-    energy : float
-        Electron energy [eV].
-    max_angle : float
-        Largest collected scattering angle [mrad].
-    atoms : ase.Atoms, optional
-        The specimen. Without it only the angular condition is applied, which
-        on its own is not enough for a converged pattern.
-    tolerance : float, optional
-        Passed to :func:`potential_sampling` (default 0.01).
-    safety : float, optional
-        Passed to :func:`maximum_sampling`.
-
-    Returns
-    -------
-    sampling : float
-        Recommended sampling [Å].
-    """
-    angular = maximum_sampling(energy, max_angle, safety=safety)
-
-    if atoms is None:
-        return angular
-
-    return min(angular, potential_sampling(atoms, tolerance=tolerance))
+    return np.asarray(result.array)
 
 
 class EBSDReferencePattern(CopyMixin, EqualityMixin):
@@ -294,18 +163,45 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
     Parameters
     ----------
-    atoms : ase.Atoms
-        The unit cell of the crystal.
-    probe : Probe
-        The incident beam.
+    atoms : ase.Atoms or FrozenPhonons
+        The unit cell of the crystal. Give :class:`~abtem.FrozenPhonons` of it
+        for thermal vibrations -- EMsoft's Debye-Waller factor: every slab is
+        displaced configuration by configuration, as the unit cell would be,
+        and the pattern is the average over them, of the scattering and the
+        emitting atoms alike. It costs `num_configs` times as much.
+    energy : float
+        Energy of the incident beam [eV].
+    slab_cell : tuple of three float
+        Dimensions of the slab cut for each patch [Å]; the third entry is the
+        thickness along the beam. There is no default: the right size depends
+        on the crystal and on how converged the pattern has to be, and a
+        default is how an undersized slab goes unnoticed.
+
+        The thickness matters most. The Kikuchi bands build up with depth, and
+        a thin slab leaves them too weak to hide the small differences between
+        neighbouring patches: silicon at 30 keV, 40 Å thick, breaks into facets
+        along the patch boundaries around ``[101]`` -- as badly 20 Å wide as
+        10 Å -- while 100 Å gives continuous bands at either width (measured
+        with the original implementation's source). That implementation was
+        validated at 40 x 40 x 100 Å.
+
+        The width sets how far a wave travels before it meets a seam. A slab
+        cut at an arbitrary orientation is not periodic across its faces, and
+        a reciprocity wave at an angle ``θ`` to the slab's axis drifts ``θ T``
+        sideways over the thickness ``T``, into the misaligned crystal beyond a
+        seam, where it stops channelling. Silicon near ``[101]``, 40 Å thick,
+        loses 14% of its yield 150 mrad off the slab's axis at 12 Å wide, and
+        7% at 24 Å. The default 400 patches keep every direction within 90
+        mrad of its slab's axis, and at 20 x 20 x 100 Å the pattern then dims
+        by less than 1% towards the patch edges, averaged over the hemisphere.
+        10 Å wide also swings by 12% in atom count from one patch to the next.
+
+        To make a run cheaper, lower `gpts`, which sets how many directions are
+        calculated, rather than the slab.
     n_patches : int, optional
-        Number of zone-axis patches tiling the hemisphere (default 400). More
-        patches means smaller patches, so a smaller collection angle, a coarser
-        sampling and a cheaper run each -- but more runs.
-    slab_cell : tuple of three float, optional
-        Dimensions of the slab cut for each patch [Å] (default
-        ``(10.0, 10.0, 40.0)``). The third entry is the thickness along the
-        beam.
+        Number of zone-axis patches tiling each hemisphere calculated (default
+        400). More patches keep every direction closer to its slab's axis, at
+        the cost of more slabs.
     gpts : int, optional
         Pixels along each axis of the projected image (default 128). Only sets
         the default density of the sampled directions; the projection itself
@@ -324,12 +220,9 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         interpolated to either projection without gaps, while the reverse
         leaves holes.
     sampling : float, optional
-        Real-space sampling of the potential [Å]. Defaults to
-        :func:`recommended_sampling`, which is the finer of what the patch
-        half-angle needs and what resolving `atoms` needs -- usually the
-        latter, by a factor of two or so. A value too coarse for the collected
-        angles is warned about; one too coarse to resolve the atoms is not,
-        since that is a convergence question rather than an outright failure.
+        Real-space sampling of the potentials [Å]. Defaults to
+        :func:`potential_sampling` for `atoms`; the collected angles set no
+        condition of their own.
     slice_thickness : float, optional
         Multislice slice thickness [Å] (default 1.0).
     direction_gpts : int, optional
@@ -337,13 +230,9 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         Defaults to ``ceil(1.15 * gpts)``, slightly denser than the output image
         so binning leaves no empty pixels.
     max_angle : float, optional
-        Angular radius of each patch [mrad]. Defaults to
-        :func:`patch_half_angle` for `n_patches`.
-    overlap_tolerance : float, optional
-        Directions within this angle [rad] of belonging to a second patch are
-        calculated in both, and the results averaged when the pattern is
-        projected. Default 0.0, ie. every direction belongs to its nearest
-        zone axis alone.
+        Angular radius of each patch [mrad]: directions farther than this from
+        their patch's axis are left out. Defaults to :func:`patch_half_angle`
+        for `n_patches`, which leaves out none.
     repetitions : tuple of three int, optional
         Repetitions of `atoms` used to build the block the slabs are cut from.
         Defaults to the smallest block that can contain the slab at any
@@ -352,77 +241,89 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
     origin : np.ndarray, optional
         Point of `atoms` to place at the centre of every slab, passed to
         :func:`rotated_slab`. Defaults to the centroid.
-    probe_positions : int, optional
-        Side of the square grid of probe positions each patch is averaged over
-        (default 1, a single probe at the centre of the slab).
-
-        A reference pattern is meant to be a property of the crystal, but a
-        single probe samples one arbitrary position within the unit cell, and
-        the result depends on which: measured on silicon, individual positions
-        vary by up to 10% in a given direction and a centred probe sits about
-        5% from the average, with a shape correlation of 0.969. Averaging
-        incoherently over positions is what removes that dependence.
-
-        It is nearly free -- the reciprocity waves dominate the cost and do not
-        depend on where the probe is -- so 3 costs about 1.16x and 5 about
-        1.49x. What matters is the *spacing* rather than the span: 3 leaves
-        about 3% and a correlation of 0.991, while 5 reaches 1% and 0.999.
-
-        Note this is the right thing to do for a crystal and the wrong thing
-        for a defect, which it would average away. For a specimen with a
-        feature, use :meth:`~abtem.ebsd.reciprocity.EBSD.scan` at chosen
-        positions for one orientation instead.
-    probe_extent : float, optional
-        Span of that grid [Å]. Defaults to the largest lattice constant of
-        `atoms`, so the grid covers one unit cell, over which the average is
-        complete by periodicity.
-    potential_weighting, depth_weight, device :
+    hemisphere : {'north', 'south', 'both'}, optional
+        Which directions to calculate (default 'north'). A centrosymmetric
+        crystal needs only one: the other is its inversion image, which the
+        pattern supplies wherever it is asked about it
+        (:attr:`SphericalPattern.southern`). A crystal without an inversion
+        centre -- GaN, GaAs -- differs between the two, and the difference is
+        what an EBSD polarity measurement reads; calculate 'both' for it, at
+        twice the cost. The southern directions are laid out as EMsoft lays
+        them out, ``(x, y, -z)`` below each northern one.
+    backscatter_energy : float or sequence of float or BaseDistribution, optional
+        Energies of the backscattered electrons [eV]; several add a leading
+        energy axis. See :class:`~abtem.ebsd.reciprocity.EBSD`.
+    depth_weight, device :
         Passed to :class:`~abtem.ebsd.reciprocity.EBSD`.
+
+    Notes
+    -----
+    Every atom emits, lit evenly, by its cross-section for scattering straight
+    back (see :mod:`abtem.ebsd.emission`): the source EMsoft builds its master
+    patterns from, and the one that makes a reference pattern a property of the
+    crystal alone -- no incident direction singles out a patch.
+
+    A direction ``d`` is where the backscattered electrons go. By reciprocity
+    it is calculated with a plane wave travelling the other way, along ``-d``,
+    into the crystal from the side the detector is on -- so the directions
+    about a patch's centre are calculated in a slab cut along the opposite
+    direction. For a centrosymmetric crystal the distinction makes no
+    difference; for one without an inversion centre it is what puts each
+    polar face in its right hemisphere.
+
+    The intensity leaving a crystal along ``-d`` is the intensity leaving its
+    inversion image along ``d``, so the southern hemisphere is calculated as
+    the northern hemisphere of the crystal inverted about the origin: every
+    southern patch in the slab of the northern patch opposite it, cut from the
+    inverted crystal. A direction and its opposite then differ by what
+    inverting the crystal changes and nothing else -- its polarity, for GaN.
+    For a crystal with an inversion centre at the origin, nothing: the two
+    calculations are the same.
     """
 
     def __init__(
         self,
-        atoms: Atoms,
-        probe: Probe,
+        atoms: Atoms | FrozenPhonons,
+        energy: float,
+        slab_cell: tuple[float, float, float],
         n_patches: int = 400,
-        slab_cell: tuple[float, float, float] = (10.0, 10.0, 40.0),
         gpts: int = 128,
         projection: str | HemisphereProjection = "lambert",
         sampling: Optional[float] = None,
         slice_thickness: float = 1.0,
         direction_gpts: Optional[int] = None,
         max_angle: Optional[float] = None,
-        overlap_tolerance: float = 0.0,
         repetitions: Optional[tuple[int, int, int]] = None,
         origin: Optional[np.ndarray] = None,
-        probe_positions: int = 1,
-        probe_extent: Optional[float] = None,
-        potential_weighting: bool = True,
+        hemisphere: str = "north",
+        backscatter_energy=None,
         depth_weight: Optional[DepthWeight] = None,
         device: Optional[str] = None,
     ):
-        self._atoms = atoms
-        self._probe = probe
+        if hemisphere not in ("north", "south", "both"):
+            raise ValueError(
+                f"hemisphere must be 'north', 'south' or 'both', got {hemisphere!r}"
+            )
+
+        slab_cell = tuple(float(x) for x in slab_cell)
+        if len(slab_cell) != 3 or min(slab_cell) <= 0.0:
+            raise ValueError(
+                f"slab_cell must be three positive lengths [Å], got {slab_cell}"
+            )
+
+        self._atoms, self._frozen_phonons = _crystal_and_displacements(atoms)
+        self._energy = float(energy)
         self._n_patches = int(n_patches)
-        self._slab_cell = (
-            float(slab_cell[0]),
-            float(slab_cell[1]),
-            float(slab_cell[2]),
-        )
+        self._slab_cell = slab_cell
         self._gpts = int(gpts)
         self._projection = validate_projection(projection)
         self._slice_thickness = float(slice_thickness)
-        self._overlap_tolerance = float(overlap_tolerance)
         self._repetitions = repetitions
         self._origin = origin
-        self._probe_positions = int(probe_positions)
-        self._probe_extent = probe_extent
-        self._potential_weighting = potential_weighting
 
-        if self._probe_positions < 1:
-            raise ValueError(
-                f"probe_positions must be at least 1, got {probe_positions}"
-            )
+        self._hemisphere = hemisphere
+        self._backscatter_energy = backscatter_energy
+        self._centrosymmetric: Optional[bool] = None
         self._depth_weight = depth_weight
         self._device = device
 
@@ -430,20 +331,11 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
             patch_half_angle(self._n_patches) if max_angle is None else float(max_angle)
         )
 
-        energy = probe._valid_energy
-        limit = maximum_sampling(energy, self._max_angle, safety=1.0)
-
         if sampling is None:
-            self._sampling = recommended_sampling(energy, self._max_angle, atoms=atoms)
+            self._sampling = potential_sampling(self._atoms)
         else:
             self._sampling = float(sampling)
-            if self._sampling >= limit:
-                warnings.warn(
-                    f"a sampling of {self._sampling:.3f} Å cannot resolve the "
-                    f"{self._max_angle:.0f} mrad patch half-angle; the antialias "
-                    f"aperture will clip the reciprocity waves. Use less than "
-                    f"{limit:.3f} Å."
-                )
+            _warn_if_undersampled(self._atoms, self._sampling, "a")
 
         self._direction_gpts = (
             int(np.ceil(_DIRECTION_OVERSAMPLING * self._gpts))
@@ -453,13 +345,18 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
     @property
     def atoms(self) -> Atoms:
-        """The unit cell of the crystal."""
+        """The unit cell of the crystal, undisplaced."""
         return self._atoms
 
     @property
-    def probe(self) -> Probe:
-        """The incident beam."""
-        return self._probe
+    def frozen_phonons(self) -> Optional[FrozenPhonons]:
+        """The thermal displacements of the crystal, if any."""
+        return self._frozen_phonons
+
+    @property
+    def energy(self) -> float:
+        """Energy of the incident beam [eV]."""
+        return self._energy
 
     @property
     def slab_cell(self) -> tuple[float, float, float]:
@@ -482,42 +379,44 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         return self._projection
 
     @property
-    def probe_scan(self) -> Optional[CustomScan]:
-        """Probe positions each patch is averaged over, or None for one probe.
+    def hemisphere(self) -> str:
+        """Which directions are calculated: 'north', 'south' or 'both'."""
+        return self._hemisphere
 
-        A square grid about the centre of the slab, which is where a feature
-        anchored by `origin` sits.
-        """
-        if self._probe_positions == 1:
-            return None
+    @property
+    def centrosymmetric(self) -> bool:
+        """Whether the crystal has an inversion centre, so ``I(-k) = I(k)``."""
+        if self._centrosymmetric is None:
+            self._centrosymmetric = is_centrosymmetric(self._atoms)
+        return self._centrosymmetric
 
-        extent = (
-            float(np.max(self._atoms.cell.lengths()))
-            if self._probe_extent is None
-            else float(self._probe_extent)
-        )
-
-        n = self._probe_positions
-        # One period sampled without repeating its endpoints, then centred on
-        # the slab: the last point is dropped, so the grid spans
-        # extent * (n - 1) / n and its midpoint is half of that, not extent / 2.
-        offsets = np.linspace(0.0, extent * (n - 1) / n, n)
-        offsets = offsets - offsets.mean()
-        centre = np.array(self._slab_cell[:2]) / 2.0
-
-        return CustomScan(
-            [[centre[0] + dx, centre[1] + dy] for dx in offsets for dy in offsets]
-        )
+    def _in_hemisphere(self, northern: np.ndarray, southern: np.ndarray) -> np.ndarray:
+        if self._hemisphere == "north":
+            return northern
+        if self._hemisphere == "south":
+            return southern
+        return np.concatenate([northern, southern])
 
     @property
     def zone_axes(self) -> np.ndarray:
-        """The zone axis of each patch, as unit vectors of shape ``(M, 3)``."""
-        return fibonacci_hemisphere(self._n_patches)
+        """The centre of each patch, as unit vectors of shape ``(M, 3)``.
+
+        Each patch is calculated in a slab cut along the opposite direction,
+        and the southern ones, opposite the northern ones, as those in the
+        inverted crystal: see the notes.
+        """
+        northern = fibonacci_hemisphere(self._n_patches)
+        return self._in_hemisphere(northern, -northern)
 
     @property
     def directions(self) -> np.ndarray:
-        """Every sampled direction in the crystal frame, of shape ``(N, 3)``."""
-        return self._projection.grid(self._direction_gpts)
+        """Every sampled direction in the crystal frame, of shape ``(N, 3)``.
+
+        The southern ones lie ``(x, y, -z)`` below the northern ones, as
+        EMsoft lays out its southern master pattern; -0.0 on the equator.
+        """
+        northern = self._projection.grid(self._direction_gpts)
+        return self._in_hemisphere(northern, northern * np.array([1.0, 1.0, -1.0]))
 
     @property
     def max_angle(self) -> float:
@@ -526,7 +425,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
     @property
     def sampling(self) -> float:
-        """Largest acceptable real-space sampling of the potential [Å]."""
+        """Largest real-space sampling of the potentials [Å]."""
         return self._sampling
 
     @property
@@ -542,23 +441,11 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
     def _assign_directions(self) -> list[np.ndarray]:
         """Group the sampled directions by the patch that will calculate them.
 
-        Each direction goes to its nearest zone axis, plus any zone axis within
-        `overlap_tolerance` of being the nearest.
+        Each direction goes to its nearest zone axis.
         """
-        directions = self.directions
         zone_axes = self.zone_axes
-
-        cosines = directions @ zone_axes.T
-        nearest = np.max(cosines, axis=1, keepdims=True)
-
-        # Widening the acceptance by an angle, rather than by a fraction of the
-        # cosine, keeps the overlap band the same width everywhere.
-        threshold = np.cos(
-            np.arccos(np.clip(nearest, -1.0, 1.0)) + self._overlap_tolerance
-        )
-        assigned = cosines >= threshold
-
-        return [np.where(assigned[:, j])[0] for j in range(len(zone_axes))]
+        nearest = np.argmax(self.directions @ zone_axes.T, axis=1)
+        return [np.where(nearest == j)[0] for j in range(len(zone_axes))]
 
     def build(
         self,
@@ -577,7 +464,7 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         ----------
         max_batch_directions : int or str, optional
             Directions propagated at once within each patch. Passed to
-            :meth:`~abtem.ebsd.reciprocity.EBSD.scan`.
+            :meth:`~abtem.ebsd.reciprocity.EBSD.build`.
         lazy : bool, optional
             If True, return a pattern backed by a dask graph with one task per
             patch, rather than running them here. Defaults to the abTEM
@@ -599,12 +486,33 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         zone_axes = self.zone_axes
         assignment = self._assign_directions()
 
-        block = bulk_block(self._atoms, self._slab_cell, self._repetitions)
-        probe_scan = self.probe_scan
+        repetitions = (
+            estimate_repetitions(self._atoms, self._slab_cell)
+            if self._repetitions is None
+            else self._repetitions
+        )
+        block = bulk_block(self._atoms, self._slab_cell, repetitions)
 
-        # The origin is given in the frame of `atoms`; the block repeats it, so
-        # a feature anchored in the unrepeated cell keeps its coordinates.
-        origin = self._origin
+        # The origin is given in the frame of `atoms`, but that copy of the
+        # cell is the corner of the block, and a slab cut about it would be
+        # mostly empty. The equivalent point of the central copy is the same
+        # place in the crystal with the whole block around it.
+        origin = (
+            None
+            if self._origin is None
+            else central_origin(self._atoms, repetitions, self._origin)
+        )
+
+        # The southern patches are the northern ones of the inverted crystal
+        # (see the notes). Inverted about the point the slabs are cut about,
+        # the block still holds the crystal around it.
+        blocks = {False: block}
+        if self._hemisphere != "north":
+            centre_of_inversion = (
+                np.mean(block.positions, axis=0) if origin is None else origin
+            )
+            blocks[True] = block.copy()
+            blocks[True].positions = 2.0 * centre_of_inversion - block.positions
 
         # Every patch shares a slab shape and a sampling, so the grid is chosen
         # once -- at a size the FFT likes, which dominates the runtime.
@@ -612,25 +520,40 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
 
         cutoff = np.cos(self._max_angle * 1e-3)
 
+        energies, energy_weights = _validate_backscatter_energy(
+            self._backscatter_energy, self._energy
+        )
+        ensemble_shape: tuple[int, ...] = (len(energies),) if len(energies) > 1 else ()
+        ensemble_axes = (
+            [EnergyAxis(values=tuple(float(e) for e in energies))]
+            if ensemble_shape
+            else []
+        )
+
         patterns: list[SphericalPattern] = []
-        max_loss = 0.0
+
+        if lazy:
+            import dask
+
+            # One node per block, which every patch's task cuts from.
+            blocks = {south: dask.delayed(b) for south, b in blocks.items()}
 
         progress = TqdmWrapper(
             total=len(zone_axes), enabled=pbar and not lazy, leave=False
         )
         try:
-            for zone_axis, indices in zip(zone_axes, assignment):
-                slab, rotation = rotated_slab(
-                    block,
-                    zone_axis,
-                    self._slab_cell,
-                    repetitions=(1, 1, 1),
-                    origin=origin,
-                )
+            for centre, indices in zip(zone_axes, assignment):
+                # A southern patch is the northern one opposite it, in the
+                # inverted crystal.
+                south = bool(centre[2] < 0.0)
+                sign = -1.0 if south else 1.0
 
-                # Crystal frame -> slab frame, then drop whatever this patch
-                # cannot legitimately collect.
-                local = directions[indices] @ rotation.T
+                # The electrons leave along d, and the reciprocity waves come
+                # in along -d: in a slab cut along -centre, then. Crystal frame
+                # -> slab frame, and drop whatever this patch cannot
+                # legitimately collect.
+                slab_axis = -sign * centre
+                local = -sign * directions[indices] @ zone_axis_rotation(slab_axis).T
                 keep = local[:, 2] > cutoff
                 local, indices = local[keep], indices[keep]
 
@@ -639,39 +562,36 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                 if len(local) == 0:
                     continue
 
-                # The loss is reported once for the whole run below, so the
-                # per-patch warnings would be several hundred copies of it.
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", AntialiasLossWarning)
-                    result = EBSD(
-                        Potential(
-                            slab,
-                            gpts=gpts,
-                            slice_thickness=self._slice_thickness,
-                            projection="finite",
-                            device=self._device,
-                        ),
-                        probe=self._probe,
-                        detector=BackscatterDetector(directions=local),
-                        potential_weighting=self._potential_weighting,
-                        depth_weight=self._depth_weight,
-                        device=self._device,
-                    ).scan(
-                        scan=probe_scan,
-                        max_batch_directions=max_batch_directions,
-                        lazy=lazy,
+                arguments = dict(
+                    slab_axis=slab_axis,
+                    local=local,
+                    origin=origin,
+                    gpts=gpts,
+                    max_batch_directions=max_batch_directions,
+                )
+
+                if lazy:
+                    # One task per patch, run eagerly inside. Hundreds of
+                    # patches already occupy the workers; splitting each into
+                    # blocks as well, as a lone lazy scan does, repeats the
+                    # per-slice work of every block for nothing: 1.7 times the
+                    # cost, measured on 100 patches of 55 directions each.
+                    task = dask.delayed(_patch_intensities, pure=True)(
+                        self, blocks[south], **arguments
                     )
+                    array = da.from_delayed(
+                        task, shape=ensemble_shape + (len(local),), dtype=np.float32
+                    )
+                else:
+                    array = _patch_intensities(self, blocks[south], **arguments)
 
-                if not lazy:
-                    max_loss = max(max_loss, result.metadata["antialias_loss_max"])
-
-                array = result.array
-                if probe_scan is not None:
-                    # Incoherent average over the probe positions: the
-                    # generation events at different positions are independent.
-                    array = array.mean(axis=0)
-
-                patterns.append(SphericalPattern(array, directions=directions[indices]))
+                patterns.append(
+                    SphericalPattern(
+                        array,
+                        directions=directions[indices],
+                        ensemble_axes_metadata=ensemble_axes,
+                    )
+                )
         finally:
             progress.close_if_exists()
 
@@ -681,24 +601,30 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
         pattern = SphericalPattern.concatenate(patterns)
         pattern.metadata.update(
             {
-                "energy": self._probe.energy,
+                "energy": self._energy,
                 "label": "backscattered intensity",
                 "n_patches": self._n_patches,
                 "max_angle": self._max_angle,
                 "sampling": self._sampling,
                 "gpts": gpts,
                 "projection": self._projection.name,
-                "probe_positions": self._probe_positions,
-                **({} if lazy else {"antialias_loss_max": max_loss}),
+                "source": "uniform",
+                "num_configs": (
+                    1
+                    if self._frozen_phonons is None
+                    else self._frozen_phonons.num_configs
+                ),
+                "hemisphere": self._hemisphere,
+                "centrosymmetric": self.centrosymmetric,
+                **(
+                    {
+                        "backscatter_energies": [float(e) for e in energies],
+                        "energy_weights": [float(w) for w in energy_weights],
+                    }
+                    if ensemble_shape
+                    else {}
+                ),
             }
         )
-
-        if not lazy and max_loss > 0.05:
-            warnings.warn(
-                f"the antialias aperture removed up to {max_loss:.1%} of the "
-                f"intensity of a reciprocity plane wave; consider a sampling "
-                f"finer than {self._sampling:.3f} Å",
-                AntialiasLossWarning,
-            )
 
         return pattern

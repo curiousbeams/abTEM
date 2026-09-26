@@ -21,13 +21,19 @@ them.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 from ase import Atoms
 
+from abtem.inelastic.phonons import BaseFrozenPhonons, FrozenPhonons
+
 __all__ = [
+    "is_centrosymmetric",
     "fibonacci_hemisphere",
     "zone_axis_rotation",
     "estimate_repetitions",
+    "central_origin",
     "bulk_block",
     "rotated_slab",
 ]
@@ -134,9 +140,21 @@ def estimate_repetitions(
     """Repetitions of `atoms` needed to fill `cell` at any orientation.
 
     The slab is cut from a bulk block after rotation, so the block has to
-    contain the slab's bounding sphere whichever way it is turned. The longest
-    diagonal of a ``(a, b, c)`` box is ``sqrt(a**2 + b**2 + c**2)``, so the
-    block must span at least that along every axis.
+    contain the slab's bounding sphere whichever way it is turned: a ball whose
+    diameter is the slab's longest diagonal, ``sqrt(a**2 + b**2 + c**2)``.
+
+    What bounds a ball inside a parallelepiped is the separation of its
+    opposite faces, not the length of its edges, and for a non-orthogonal cell
+    the two differ -- for the primitive cell of an fcc crystal the faces are
+    ``a / sqrt(3)`` apart against edges of ``a / sqrt(2)``. Sizing on the edges
+    leaves the block too thin across those faces, and a slab turned towards
+    them loses atoms from its corners and ends: silicon cut 40 x 40 x 100 Å
+    that way comes out with vacuum in 123 of 200 patches.
+
+    One cell more is added along each axis, because the slab is not cut about
+    the geometric centre of the block but about a point up to half a cell from
+    it: the centroid of the atoms, or an origin moved into the central copy of
+    the cell by :func:`central_origin`.
 
     Parameters
     ----------
@@ -150,12 +168,57 @@ def estimate_repetitions(
     repetitions : tuple of three int
     """
     diagonal = float(np.linalg.norm(cell))
-    lengths = np.asarray(atoms.cell.lengths(), dtype=float)
+    lattice = np.asarray(atoms.cell.array, dtype=float)
 
-    if np.any(lengths <= 0.0):
-        raise ValueError("atoms must have a cell with nonzero lengths")
+    volume = abs(float(np.linalg.det(lattice)))
+    if volume == 0.0:
+        raise ValueError("atoms must have a cell with nonzero volume")
 
-    return tuple(int(np.ceil(diagonal / length)) for length in lengths)  # type: ignore[return-value]
+    # Separation of the faces spanned by the other two lattice vectors.
+    separations = [
+        volume / np.linalg.norm(np.cross(lattice[(i + 1) % 3], lattice[(i + 2) % 3]))
+        for i in range(3)
+    ]
+
+    return tuple(int(np.ceil(diagonal / s)) + 1 for s in separations)  # type: ignore[return-value]
+
+
+def central_origin(
+    atoms: Atoms, repetitions: tuple[int, int, int], origin: np.ndarray
+) -> np.ndarray:
+    """Move a point of `atoms` to the equivalent point in the middle of its block.
+
+    An origin is given in the frame of the unrepeated `atoms`, but the block
+    ``atoms * repetitions`` grows away from that frame's corner, so the point as
+    given sits at the edge of the block and a slab cut about it is mostly
+    vacuum. Shifting it by whole lattice vectors to the most central copy picks
+    out the same point of the crystal with the whole block around it.
+
+    With ``repetitions == (1, 1, 1)`` -- an atomic model holding one feature --
+    a point inside the cell is left where it is.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The unrepeated cell.
+    repetitions : tuple of three int
+        Repetitions the block was built with.
+    origin : np.ndarray
+        Cartesian point of `atoms`, of shape ``(3,)``.
+
+    Returns
+    -------
+    origin : np.ndarray
+        The equivalent Cartesian point of the block.
+    """
+    lattice = np.asarray(atoms.cell.array, dtype=float)
+    origin = np.asarray(origin, dtype=float).ravel()
+
+    fractional = np.linalg.solve(lattice.T, origin)
+    shift = np.round(np.asarray(repetitions, dtype=float) / 2.0 - fractional)
+
+    # np.round sends 0.5 to 0, so a point inside a (1, 1, 1) cell never moves.
+    return origin + shift @ lattice
 
 
 def bulk_block(
@@ -242,6 +305,13 @@ def rotated_slab(
         happen to be distributed symmetrically about it, which a void, a
         surface or an off-centre defect all break.
 
+        When the block is built here, the origin is moved to the equivalent
+        point of its central copy by :func:`central_origin`. When `atoms` is a
+        prebuilt block (``repetitions=(1, 1, 1)``) it is used as given, so
+        pass it through :func:`central_origin` first -- a point of the
+        unrepeated cell sits at the corner of the block, and the slab cut
+        about it is mostly empty.
+
     Returns
     -------
     slab : ase.Atoms
@@ -258,20 +328,24 @@ def rotated_slab(
     zone_axis = np.asarray(zone_axis, dtype=float).ravel()
     rotation = zone_axis_rotation(zone_axis)
 
+    if origin is not None:
+        origin = np.asarray(origin, dtype=float).ravel()
+        if origin.shape != (3,):
+            raise ValueError(f"origin must have shape (3,), got {origin.shape}")
+
     if repetitions == (1, 1, 1):
         # `atoms` is already the block; copy it because the rotation and the
         # recentring below are in place, and a caller reusing one block across
         # many zone axes must not see it mutated.
         block = atoms.copy()
     else:
+        if repetitions is None:
+            repetitions = estimate_repetitions(atoms, cell)
         block = bulk_block(atoms, cell, repetitions)
+        if origin is not None:
+            origin = central_origin(atoms, repetitions, origin)
 
-    if origin is None:
-        anchor = np.mean(block.positions, axis=0)
-    else:
-        anchor = np.asarray(origin, dtype=float).ravel()
-        if anchor.shape != (3,):
-            raise ValueError(f"origin must have shape (3,), got {anchor.shape}")
+    anchor = np.mean(block.positions, axis=0) if origin is None else origin
 
     # ASE's own rotation is used rather than `rotation` so that the cut is
     # reproducible against code that calls Atoms.rotate directly; the two agree
@@ -302,3 +376,88 @@ def rotated_slab(
     slab.cell = cell_array
 
     return slab, rotation
+
+
+def _crystal_and_displacements(
+    atoms: Atoms | BaseFrozenPhonons,
+) -> tuple[Atoms, Optional[FrozenPhonons]]:
+    """The crystal the slabs are cut from, and how to displace them thermally.
+
+    Each atom is tagged with its index in the crystal, so that displacements
+    given atom by atom follow it through the block into every slab.
+    """
+    if isinstance(atoms, FrozenPhonons):
+        frozen_phonons, atoms = atoms, atoms.atoms
+    elif isinstance(atoms, BaseFrozenPhonons):
+        raise TypeError(
+            f"slabs are cut from one crystal, and a {type(atoms).__name__} holds "
+            f"several; give Atoms, or FrozenPhonons for thermal displacements"
+        )
+    else:
+        frozen_phonons = None
+
+    atoms = atoms.copy()
+    atoms.set_array("cell_index", np.arange(len(atoms)))
+    return atoms, frozen_phonons
+
+
+def _displaced(
+    slab: Atoms, frozen_phonons: Optional[FrozenPhonons]
+) -> Atoms | FrozenPhonons:
+    """The slab, displaced as `frozen_phonons` displaces the crystal it came from.
+
+    The same number of configurations, the same seeds, and each atom the
+    displacements of its own site in the crystal.
+    """
+    if frozen_phonons is None:
+        return slab
+
+    sigmas = frozen_phonons.sigmas
+    if not isinstance(sigmas, dict):
+        # given atom by atom, for the atoms of the crystal
+        sigmas = np.asarray(sigmas)[slab.arrays["cell_index"]]
+
+    return FrozenPhonons(
+        slab,
+        num_configs=frozen_phonons.num_configs,
+        sigmas=sigmas,
+        directions=frozen_phonons.directions,
+        seed=frozen_phonons.seed,
+    )
+
+
+def is_centrosymmetric(atoms: Atoms, symprec: float = 1e-3) -> bool:
+    """Whether a crystal has a centre of inversion.
+
+    For a centrosymmetric crystal the backscatter pattern obeys
+    ``I(-k) = I(k)``, so either hemisphere follows from the other; for one
+    without -- GaN, GaAs, ZnO -- the two differ, and the difference is what an
+    EBSD polarity measurement reads.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The crystal's unit cell.
+    symprec : float, optional
+        Tolerance on positions [Å] for the symmetry search (default 1e-3).
+
+    Returns
+    -------
+    centrosymmetric : bool
+    """
+    import warnings
+
+    import spglib  # type: ignore[import-untyped]
+
+    cell = (atoms.cell.array, atoms.get_scaled_positions(), atoms.numbers)
+    with warnings.catch_warnings():
+        # spglib deprecates its own internal error handling; nothing the
+        # caller can act on, and it would otherwise fail under -W error.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        symmetry = spglib.get_symmetry(cell, symprec=symprec)
+    if symmetry is None:
+        raise ValueError("spglib could not determine the symmetry of the crystal")
+    inversion = -np.eye(3, dtype=int)
+    return any(
+        np.array_equal(rotation, inversion) for rotation in symmetry["rotations"]
+    )

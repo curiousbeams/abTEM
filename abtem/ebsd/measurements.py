@@ -73,13 +73,107 @@ class EBSDPatternImages(Images):
         ]
 
 
+def _lambert_grid(xy: np.ndarray, tolerance: float = 1e-6):
+    """The Lambert grid a set of points was drawn from, if they were.
+
+    Parameters
+    ----------
+    xy : np.ndarray
+        Points in the square Lambert plane, of shape ``(N, 2)``.
+
+    Returns
+    -------
+    grid : tuple of (int, np.ndarray) or None
+        ``(gpts, nodes)``, where `nodes` holds each point's integer node
+        position of shape ``(N, 2)`` on ``linspace(-1, 1, gpts)`` along both
+        axes -- or None unless the points lie on such a grid and cover every
+        node of it. Repeated nodes, as an overlap between patches produces,
+        are allowed.
+    """
+    if len(xy) < 4:
+        return None
+
+    gpts = len(np.unique(np.round(xy[:, 0], 8)))
+    if gpts < 2:
+        return None
+
+    position = (xy + 1.0) / 2.0 * (gpts - 1)
+    nodes = np.rint(position)
+    if np.max(np.abs(position - nodes)) > tolerance:
+        return None
+
+    nodes = nodes.astype(int)
+    if len(np.unique(nodes[:, 0] * gpts + nodes[:, 1])) != gpts * gpts:
+        return None
+
+    return gpts, nodes
+
+
+def _bilinear(
+    values: np.ndarray, gpts: int, nodes: np.ndarray, xy: np.ndarray
+) -> np.ndarray:
+    """Bilinear interpolation on a Lambert grid, as EMsoft does it.
+
+    A transcription of EMsoft's ``LambertgetInterpolation``: the lower node is
+    ``floor`` of the target's position in node units, the upper one the next
+    node along, held at the last node on the edge of the square, and the four
+    are weighted by the distances ``dx, 1 - dx, dy, 1 - dy``.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Sampled values, of shape ``(ensemble, N)``, at the points `nodes`
+        indexes. Values sharing a node are averaged.
+    gpts : int
+        Nodes along each axis of the grid.
+    nodes : np.ndarray
+        Integer node position of each sample, of shape ``(N, 2)``.
+    xy : np.ndarray
+        Targets in the square Lambert plane, of shape ``(M, 2)``.
+
+    Returns
+    -------
+    interpolated : np.ndarray
+        Array of shape ``(ensemble, M)``.
+    """
+    index = nodes[:, 0] * gpts + nodes[:, 1]
+    totals = np.zeros((len(values), gpts * gpts))
+    counts = np.zeros(gpts * gpts)
+    np.add.at(totals, (slice(None), index), values)
+    np.add.at(counts, index, 1.0)
+    image = (totals / counts).reshape(len(values), gpts, gpts)
+
+    position = np.clip((xy + 1.0) / 2.0 * (gpts - 1), 0.0, gpts - 1)
+    lower = np.floor(position).astype(int)
+    upper = np.minimum(lower + 1, gpts - 1)
+    d = position - lower
+
+    ix, iy, jx, jy = lower[:, 0], lower[:, 1], upper[:, 0], upper[:, 1]
+    dx, dy = d[:, 0], d[:, 1]
+
+    return (
+        image[:, ix, iy] * (1 - dx) * (1 - dy)
+        + image[:, jx, iy] * dx * (1 - dy)
+        + image[:, ix, jy] * (1 - dx) * dy
+        + image[:, jx, jy] * dx * dy
+    )
+
+
 class SphericalPattern(CopyMixin, EqualityMixin):
-    """Backscattered intensity sampled at directions on the unit hemisphere.
+    """Backscattered intensity sampled at directions on the unit sphere.
 
     This is the natural output of a reference-pattern calculation: the
-    directions are chosen to tile the hemisphere evenly, which makes them an
+    directions are chosen to tile a hemisphere evenly, which makes them an
     unstructured list rather than a grid. Use :meth:`project` to turn it into a
     square image.
+
+    A pattern may cover the northern hemisphere, the southern one, or both
+    (:attr:`hemisphere`). Where it is asked about the hemisphere it does not
+    cover, it answers from the inversion image of the one it does,
+    ``I(-k) = I(k)``, which holds for a centrosymmetric crystal. A pattern that
+    records in its metadata that its crystal is not centrosymmetric -- as
+    :class:`~abtem.ebsd.reference.EBSDReferencePattern` records it -- warns
+    when it does so; see :attr:`northern` and :attr:`southern`.
 
     Unlike most abTEM measurements this is not an
     :class:`~abtem.array.ArrayObject`. Its base axis is a list of ``(N, 3)``
@@ -190,6 +284,77 @@ class SphericalPattern(CopyMixin, EqualityMixin):
     def __len__(self) -> int:
         return len(self._directions)
 
+    @property
+    def hemisphere(self) -> str:
+        """Which hemispheres the pattern covers: 'north', 'south' or 'both'.
+
+        A direction belongs to the south when its ``z`` component is negative,
+        -0.0 included: the equator of a southern grid, mirrored from a
+        northern one, stays southern.
+        """
+        south = np.signbit(self._directions[:, 2])
+        if south.all():
+            return "south"
+        return "both" if south.any() else "north"
+
+    @property
+    def centrosymmetric(self) -> Optional[bool]:
+        """Whether the crystal has an inversion centre, if the pattern records it."""
+        value = self._metadata.get("centrosymmetric")
+        return None if value is None else bool(value)
+
+    def _hemisphere_pattern(self, south: bool) -> "SphericalPattern":
+        """The pattern over one hemisphere: its own, or the inversion image."""
+        inside = np.signbit(self._directions[:, 2]) == south
+        if inside.any():
+            if inside.all():
+                return self
+            return self.__class__(
+                self._array[..., inside],
+                self._directions[inside],
+                ensemble_axes_metadata=self._ensemble_axes_metadata,
+                metadata=self._metadata,
+            )
+
+        if self.centrosymmetric is False:
+            missing, computed = (
+                ("southern", "north") if south else ("northern", "south")
+            )
+            warnings.warn(
+                f"the {missing} hemisphere was not calculated, and the crystal "
+                f"is not centrosymmetric, so the inversion image of the "
+                f"{computed}ern one standing in for it is not the right answer; "
+                f"build the reference pattern with hemisphere='both'"
+            )
+        return self.__class__(
+            self._array,
+            -self._directions,
+            ensemble_axes_metadata=self._ensemble_axes_metadata,
+            metadata=self._metadata,
+        )
+
+    @property
+    def northern(self) -> "SphericalPattern":
+        """The pattern over the northern hemisphere.
+
+        The calculated one if the pattern covers it; otherwise the inversion
+        image of the southern hemisphere, ``I(k) = I(-k)``, exact for a
+        centrosymmetric crystal -- and warned about when the pattern records
+        that its crystal is not.
+        """
+        return self._hemisphere_pattern(south=False)
+
+    @property
+    def southern(self) -> "SphericalPattern":
+        """The pattern over the southern hemisphere.
+
+        The calculated one if the pattern covers it; otherwise the inversion
+        image of the northern hemisphere, ``I(-k) = I(k)``, exact for a
+        centrosymmetric crystal -- and warned about when the pattern records
+        that its crystal is not.
+        """
+        return self._hemisphere_pattern(south=True)
+
     def interpolate_directions(self, directions: np.ndarray) -> np.ndarray:
         """Evaluate the pattern at arbitrary directions.
 
@@ -201,19 +366,29 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         equal-area, it distorts the neighbourhoods least, and it covers the
         whole hemisphere, so a pattern sampled there has no target outside it.
 
+        A pattern sampled on the nodes of a Lambert grid -- as
+        :class:`~abtem.ebsd.reference.EBSDReferencePattern` samples by default
+        -- is interpolated bilinearly on that grid, which is what EMsoft and
+        kikuchipy do with a master pattern (EMsoft's
+        ``LambertgetInterpolation``), so a pattern evaluated here and one read
+        from its EMsoft export agree. Any other sampling is triangulated and
+        interpolated linearly. That is worse on a regular grid, not merely
+        different: triangulating one cuts every cell along the same diagonal,
+        and a band crossing that diagonal comes out serrated.
+
         Parameters
         ----------
         directions : np.ndarray
-            Unit vectors of shape ``(M, 3)``. Those in the southern hemisphere
-            are evaluated at their mirror image, which is correct for a
-            centrosymmetric crystal and wrong otherwise.
+            Unit vectors of shape ``(M, 3)``, anywhere on the sphere. Each is
+            evaluated from its own hemisphere: from the calculated one, or
+            from the inversion image of the other when the pattern does not
+            cover it (see :attr:`southern`).
 
         Returns
         -------
         values : np.ndarray
             Array of shape ``self.ensemble_shape + (M,)``.
         """
-        from scipy.interpolate import griddata  # type: ignore[import-untyped]
 
         if self.is_lazy:
             raise RuntimeError(
@@ -227,16 +402,39 @@ class SphericalPattern(CopyMixin, EqualityMixin):
                 f"directions must have shape (M, 3), got {directions.shape}"
             )
 
+        values = np.empty(self.ensemble_shape + (len(directions),))
+        south = np.signbit(directions[:, 2])
+        for in_south in (False, True):
+            wanted = south == in_south
+            if wanted.any():
+                pattern = self.southern if in_south else self.northern
+                values[..., wanted] = pattern._interpolate_one_hemisphere(
+                    directions[wanted], mirror=in_south
+                )
+        return values
+
+    def _interpolate_one_hemisphere(
+        self, directions: np.ndarray, mirror: bool
+    ) -> np.ndarray:
+        """Interpolate a pattern covering one hemisphere, at directions in it.
+
+        The square Lambert projection covers the northern hemisphere; a
+        southern one is mirrored onto it through the equator, ``(x, y, -z)``,
+        which is how EMsoft lays out its southern master pattern.
+        """
+        from scipy.interpolate import griddata  # type: ignore[import-untyped]
+
         lambert = validate_projection("lambert")
+        flip = np.array([1.0, 1.0, -1.0 if mirror else 1.0])
 
-        northern = self._directions[:, 2] >= 0.0
-        source = lambert.project(self._directions[northern])
+        source = lambert.project(self._directions * flip)
+        target = lambert.project(directions * flip)
+        flat = self._array.reshape(-1, len(self._directions))
 
-        target = lambert.project(
-            np.where(directions[:, 2:3] >= 0.0, directions, -directions)
-        )
-
-        flat = self._array.reshape(-1, len(self._directions))[:, northern]
+        grid = _lambert_grid(source)
+        if grid is not None:
+            values = _bilinear(flat, *grid, target)
+            return values.reshape(self.ensemble_shape + (len(directions),))
 
         values = np.empty((len(flat), len(directions)))
         fraction_filled = 0.0
@@ -265,6 +463,7 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         self,
         gpts: int,
         projection: str | HemisphereProjection = "lambert",
+        hemisphere: str = "north",
     ) -> ReferencePatternImages:
         """Sample the intensities at the nodes of a square grid.
 
@@ -286,6 +485,11 @@ class SphericalPattern(CopyMixin, EqualityMixin):
         projection : str or HemisphereProjection, optional
             One of ``'lambert'`` (default, the master-pattern convention) or
             ``'stereographic'``.
+        hemisphere : {'north', 'south'}, optional
+            Which hemisphere to lay out (default 'north'). The southern one is
+            laid out as EMsoft lays out its southern master pattern: the node
+            at ``(X, Y)`` is the direction ``(x, y, -z)`` below the northern
+            one there.
 
         Returns
         -------
@@ -294,13 +498,21 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             stereographic disk does not cover -- are zero.
         """
         projection = validate_projection(projection)
+        if hemisphere not in ("north", "south"):
+            raise ValueError(
+                f"hemisphere must be 'north' or 'south', got {hemisphere!r}"
+            )
 
         nodes = np.linspace(-1.0, 1.0, gpts)
         x, y = np.meshgrid(nodes, nodes, indexing="ij")
         square = np.stack([x.ravel(), y.ravel()], axis=1)
         inside = projection.domain_mask(square)
 
-        values = self.interpolate_directions(projection.unproject(square[inside]))
+        directions = projection.unproject(square[inside])
+        if hemisphere == "south":
+            # -0.0 on the equator, so that it counts as southern too
+            directions = directions * np.array([1.0, 1.0, -1.0])
+        values = self.interpolate_directions(directions)
 
         images = np.zeros(self.ensemble_shape + (gpts * gpts,))
         images[..., inside] = values
@@ -310,7 +522,11 @@ class SphericalPattern(CopyMixin, EqualityMixin):
             images,
             sampling=2.0 / (gpts - 1),
             ensemble_axes_metadata=self.ensemble_axes_metadata,
-            metadata={**self._metadata, "projection": projection.name},
+            metadata={
+                **self._metadata,
+                "projection": projection.name,
+                "hemisphere": hemisphere,
+            },
         )
 
     def bin(

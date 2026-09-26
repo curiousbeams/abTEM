@@ -189,8 +189,10 @@ def write_emsoft_master_pattern(
     path : str
         Destination ``.h5`` file.
     pattern : SphericalPattern
-        The reference pattern, covering the northern hemisphere. Must not have
-        ensemble axes.
+        The reference pattern. Must not have ensemble axes. Its southern
+        hemisphere is written from the pattern itself when it covers it (built
+        with ``hemisphere='both'``), and otherwise from the inversion image of
+        the northern one -- see :attr:`SphericalPattern.southern`.
     atoms : ase.Atoms
         The unit cell the pattern was calculated from, used for the crystal
         metadata a consumer needs to build a phase.
@@ -216,11 +218,12 @@ def write_emsoft_master_pattern(
 
     Notes
     -----
-    The southern hemisphere is filled by assuming the crystal is
-    centrosymmetric, so that ``I(-k) = I(k)``. On the Lambert square that is a
-    180° rotation of the northern array. For a non-centrosymmetric crystal the
-    southern hemisphere is a genuinely different calculation, which this
-    reference pattern does not contain.
+    A pattern covering only the northern hemisphere fills the southern one by
+    assuming the crystal is centrosymmetric, ``I(-k) = I(k)``: on the Lambert
+    square, a 180° rotation of the northern array. For a crystal without an
+    inversion centre that is wrong, and the pattern warns when it records as
+    much; build it with ``hemisphere='both'`` to write the southern hemisphere
+    that was actually calculated.
 
     No background, energy spectrum or depth distribution is written: those are
     Monte Carlo products. Consumers that expect them will fall back to a flat
@@ -267,9 +270,12 @@ def write_emsoft_master_pattern(
     # verified against kikuchipy, which reproduces this module's own detector
     # projection only once the stored array is transposed.
     northern = np.asarray(pattern.interpolate(2 * npx + 1, "lambert").array).T
-    # I(-k) = I(k) is a 180 degree rotation of the Lambert square, since the
-    # projection is odd in the in-plane coordinates at fixed z.
-    southern = northern[::-1, ::-1]
+    # the node at (X, Y) of the southern square is the direction (x, y, -z);
+    # for a pattern of the northern hemisphere alone that is the inversion
+    # image, a 180 degree rotation of the northern square
+    southern = np.asarray(
+        pattern.interpolate(2 * npx + 1, "lambert", hemisphere="south").array
+    ).T
 
     # The stereographic arrays are a display convenience -- EMsoft and
     # kikuchipy both project detector patterns from the Lambert ones. A pattern
@@ -280,7 +286,9 @@ def write_emsoft_master_pattern(
         stereographic_n = np.asarray(
             pattern.interpolate(2 * npx + 1, "stereographic").array
         ).T
-    stereographic_s = stereographic_n[::-1, ::-1]
+        stereographic_s = np.asarray(
+            pattern.interpolate(2 * npx + 1, "stereographic", hemisphere="south").array
+        ).T
 
     if np.any(northern < 0.0):
         warnings.warn(
