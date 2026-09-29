@@ -557,8 +557,6 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                 keep = local[:, 2] > cutoff
                 local, indices = local[keep], indices[keep]
 
-                progress.update_if_exists(1)
-
                 if len(local) == 0:
                     continue
 
@@ -584,6 +582,8 @@ class EBSDReferencePattern(CopyMixin, EqualityMixin):
                     )
                 else:
                     array = _patch_intensities(self, blocks[south], **arguments)
+
+                progress.update_if_exists(1)
 
                 patterns.append(
                     SphericalPattern(
